@@ -1,0 +1,24 @@
+{
+  "name": "chriswangplus-plugins",
+  "owner": {
+    "name": "chriswangplus-boop"
+  },
+  "metadata": {
+    "description": "Personal Claude Code plugins by chriswangplus-boop",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "context-window-monitor",
+      "source": ".",
+      "description": "Monitor context window usage across all Claude Code sessions. Alerts at configurable thresholds and offers /memory + /compact actions.",
+      "version": "1.0.0",
+      "author": {
+        "name": "chriswangplus-boop"
+      },
+      "license": "MIT",
+      "keywords": ["context", "monitor", "memory", "compact", "usage"],
+      "category": "productivity"
+    }
+  ]
+}

@@ -1,8 +1,0 @@
-{
-  "name": "context-window-monitor",
-  "version": "1.0.0",
-  "description": "Global plugin to monitor context window usage across all Claude Code sessions. Alerts when usage exceeds a configurable threshold and offers to save memory and compact the conversation.",
-  "author": "chriswangplus-boop",
-  "keywords": ["context", "monitor", "memory", "compact", "usage"],
-  "license": "MIT"
-}

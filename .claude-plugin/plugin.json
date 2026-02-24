@@ -1,0 +1,11 @@
+{
+  "name": "context-window-monitor",
+  "version": "1.0.0",
+  "description": "Monitor context window usage across all Claude Code sessions. Alerts at configurable thresholds and offers /memory + /compact actions.",
+  "author": {
+    "name": "chriswangplus-boop"
+  },
+  "license": "MIT",
+  "keywords": ["context", "monitor", "memory", "compact", "usage"],
+  "category": "productivity"
+}
