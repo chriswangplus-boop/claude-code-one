@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "context-window-monitor",
-      "source": ".",
+      "source": "./plugins/context-window-monitor",
       "description": "Monitor context window usage across all Claude Code sessions. Alerts at configurable thresholds and offers /memory + /compact actions.",
       "version": "1.0.0",
       "author": {
