@@ -7,6 +7,5 @@
   },
   "license": "MIT",
   "keywords": ["context", "monitor", "memory", "compact", "usage"],
-  "category": "productivity",
-  "hooks": "./hooks/hooks.json"
+  "category": "productivity"
 }
