@@ -27,6 +27,7 @@ if [ -z "$TRANSCRIPT_PATH" ]; then
 fi
 
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
+    echo "[Context Window Monitor] No transcript found — skipping." >&2
     exit 0
 fi
 
@@ -48,4 +49,5 @@ if [ "$USAGE_PCT" -ge "$THRESHOLD" ]; then
     exit 2
 fi
 
+echo "[Context Window Monitor] OK: ~${USAGE_PCT}% estimated usage" >&2
 exit 0

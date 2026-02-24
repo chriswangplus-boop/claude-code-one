@@ -252,6 +252,7 @@ def run_auto_mode(hook_input):
     transcript_path = hook_input.get("transcript_path", "")
 
     if not transcript_path or not os.path.exists(transcript_path):
+        print("[Context Window Monitor] No transcript found — skipping.", file=sys.stderr)
         sys.exit(0)
 
     config = load_config()
@@ -320,6 +321,7 @@ def run_auto_mode(hook_input):
         sys.exit(2)
     else:
         save_state(session_id, state)
+        print(f"[Context Window Monitor] OK: ~{usage_pct}% used ({format_tokens(estimated_tokens)} / {format_tokens(max_tokens)} tokens)", file=sys.stderr)
         sys.exit(0)
 
 
