@@ -176,13 +176,78 @@ def format_tokens(n):
     return str(n)
 
 
-def main():
-    # Read hook input from stdin
-    try:
-        hook_input = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
-        sys.exit(0)
+def generate_usage_bar(usage_pct):
+    """Generate a visual progress bar for context usage."""
+    bar_width = 30
+    filled = int(bar_width * min(usage_pct, 100) / 100)
+    empty = bar_width - filled
+    bar = "#" * filled + "-" * empty
+    return f"[{bar}] {usage_pct}%"
 
+
+def generate_report(estimated_tokens, max_tokens, usage_pct, message_count, config):
+    """Generate a full context usage report (always printed, regardless of threshold)."""
+    lines = []
+    lines.append("[Context Window Monitor] Status Report")
+    lines.append("=" * 50)
+    lines.append("")
+    lines.append(f"  Estimated tokens:  {format_tokens(estimated_tokens)} / {format_tokens(max_tokens)}")
+    lines.append(f"  Messages:          {message_count}")
+    lines.append(f"  Usage:             {generate_usage_bar(usage_pct)}")
+    lines.append("")
+
+    remaining_tokens = max(0, max_tokens - estimated_tokens)
+    lines.append(f"  Remaining:         ~{format_tokens(remaining_tokens)} tokens")
+    lines.append(f"  Alert threshold:   {config['threshold_percent']}%")
+    lines.append("")
+
+    if usage_pct >= 95:
+        lines.append("  Status: CRITICAL - Compact immediately!")
+    elif usage_pct >= 90:
+        lines.append("  Status: HIGH - Consider compacting soon")
+    elif usage_pct >= config["threshold_percent"]:
+        lines.append("  Status: WARNING - Approaching limit")
+    elif usage_pct >= 50:
+        lines.append("  Status: OK - Moderate usage")
+    else:
+        lines.append("  Status: OK - Plenty of room")
+
+    lines.append("")
+    lines.append("  Actions: /memory (save context) | /compact (compress)")
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+
+def run_report_mode(hook_input):
+    """
+    Manual report mode: always prints a full status report.
+    Triggered by UserPromptSubmit hook when user types a trigger keyword.
+    """
+    transcript_path = hook_input.get("transcript_path", "")
+    if not transcript_path or not os.path.exists(transcript_path):
+        print("[Context Window Monitor] No transcript found for this session.")
+        sys.exit(2)
+
+    config = load_config()
+    estimated_tokens, message_count = estimate_tokens_from_transcript(
+        transcript_path, config["chars_per_token"]
+    )
+    max_tokens = config["max_context_tokens"]
+    usage_pct = (estimated_tokens * 100) // max_tokens if max_tokens > 0 else 0
+
+    report = generate_report(estimated_tokens, max_tokens, usage_pct, message_count, config)
+    print(report)
+    print("")
+    print("Please share this report with the user.")
+    # Exit 2 to inject the report into the conversation
+    sys.exit(2)
+
+
+def run_auto_mode(hook_input):
+    """
+    Automatic mode: runs on Stop hook, only alerts if usage exceeds threshold.
+    Respects cooldown to avoid repeated warnings.
+    """
     session_id = hook_input.get("session_id", "unknown")
     transcript_path = hook_input.get("transcript_path", "")
 
@@ -256,6 +321,24 @@ def main():
     else:
         save_state(session_id, state)
         sys.exit(0)
+
+
+def main():
+    # Read hook input from stdin
+    try:
+        hook_input = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        sys.exit(0)
+
+    # Determine mode: --report flag or CONTEXT_MONITOR_MODE env var
+    mode = os.environ.get("CONTEXT_MONITOR_MODE", "auto")
+    if "--report" in sys.argv:
+        mode = "report"
+
+    if mode == "report":
+        run_report_mode(hook_input)
+    else:
+        run_auto_mode(hook_input)
 
 
 if __name__ == "__main__":
