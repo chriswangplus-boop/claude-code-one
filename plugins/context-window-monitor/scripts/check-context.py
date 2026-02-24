@@ -225,7 +225,7 @@ def run_report_mode(hook_input):
     """
     transcript_path = hook_input.get("transcript_path", "")
     if not transcript_path or not os.path.exists(transcript_path):
-        print("[Context Window Monitor] No transcript found for this session.")
+        print("[Context Window Monitor] No transcript found for this session.", file=sys.stderr)
         sys.exit(2)
 
     config = load_config()
@@ -236,9 +236,9 @@ def run_report_mode(hook_input):
     usage_pct = (estimated_tokens * 100) // max_tokens if max_tokens > 0 else 0
 
     report = generate_report(estimated_tokens, max_tokens, usage_pct, message_count, config)
-    print(report)
-    print("")
-    print("Please share this report with the user.")
+    print(report, file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Please share this report with the user.", file=sys.stderr)
     # Exit 2 to inject the report into the conversation
     sys.exit(2)
 
@@ -293,28 +293,28 @@ def run_auto_mode(hook_input):
 
         severity = "CRITICAL" if usage_pct >= 95 else "HIGH" if usage_pct >= 90 else "WARNING"
 
-        print(f"[Context Window Monitor] {severity}: ~{usage_pct}% used ({format_tokens(estimated_tokens)} / {format_tokens(max_tokens)} tokens, {message_count} messages)")
-        print("")
+        print(f"[Context Window Monitor] {severity}: ~{usage_pct}% used ({format_tokens(estimated_tokens)} / {format_tokens(max_tokens)} tokens, {message_count} messages)", file=sys.stderr)
+        print("", file=sys.stderr)
 
         if usage_pct >= 95:
-            print("The context window is nearly full. Auto-compaction may happen soon and could lose important context.")
-            print("")
-            print("STRONGLY RECOMMENDED: Inform the user immediately and suggest:")
-            print("  1. Run /memory to save key decisions and progress before compacting")
-            print("  2. Run /compact to compress the conversation")
-            print("  3. Or start a new session if the current task is complete")
+            print("The context window is nearly full. Auto-compaction may happen soon and could lose important context.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("STRONGLY RECOMMENDED: Inform the user immediately and suggest:", file=sys.stderr)
+            print("  1. Run /memory to save key decisions and progress before compacting", file=sys.stderr)
+            print("  2. Run /compact to compress the conversation", file=sys.stderr)
+            print("  3. Or start a new session if the current task is complete", file=sys.stderr)
         elif usage_pct >= 90:
-            print("The context window is getting very full.")
-            print("")
-            print("Please inform the user and recommend:")
-            print("  1. Run /memory to save important context")
-            print("  2. Run /compact to compress the conversation")
+            print("The context window is getting very full.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Please inform the user and recommend:", file=sys.stderr)
+            print("  1. Run /memory to save important context", file=sys.stderr)
+            print("  2. Run /compact to compress the conversation", file=sys.stderr)
         else:
-            print("The context window is approaching its limit.")
-            print("")
-            print("Please let the user know and offer these options:")
-            print("  1. Run /memory to save important context, then /compact")
-            print("  2. Continue working (next check in {} minutes)".format(config["warning_cooldown_minutes"]))
+            print("The context window is approaching its limit.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Please let the user know and offer these options:", file=sys.stderr)
+            print("  1. Run /memory to save important context, then /compact", file=sys.stderr)
+            print("  2. Continue working (next check in {} minutes)".format(config["warning_cooldown_minutes"]), file=sys.stderr)
 
         # Exit code 2 blocks the stop and injects this message into conversation
         sys.exit(2)

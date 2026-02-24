@@ -29,5 +29,5 @@ if [ -f "$STATE_FILE" ]; then
 fi
 
 # Log the compaction event
-echo "[Context Window Monitor] Context compacted. Monitoring state reset."
+echo "[Context Window Monitor] Context compacted. Monitoring state reset." >&2
 exit 0

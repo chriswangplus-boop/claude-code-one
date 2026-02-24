@@ -39,12 +39,12 @@ THRESHOLD=${CONTEXT_MONITOR_THRESHOLD:-80}
 USAGE_PCT=$((FILE_SIZE * 100 / MAX_CHARS))
 
 if [ "$USAGE_PCT" -ge "$THRESHOLD" ]; then
-    echo "[Context Window Monitor] WARNING: ~${USAGE_PCT}% estimated usage (${FILE_SIZE} chars)"
-    echo ""
-    echo "The context window is approaching its limit."
-    echo "Please inform the user and suggest:"
-    echo "  1. Run /memory to save important context"
-    echo "  2. Run /compact to compress the conversation"
+    echo "[Context Window Monitor] WARNING: ~${USAGE_PCT}% estimated usage (${FILE_SIZE} chars)" >&2
+    echo "" >&2
+    echo "The context window is approaching its limit." >&2
+    echo "Please inform the user and suggest:" >&2
+    echo "  1. Run /memory to save important context" >&2
+    echo "  2. Run /compact to compress the conversation" >&2
     exit 2
 fi
 
