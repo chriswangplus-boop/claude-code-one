@@ -1,0 +1,6 @@
+{
+  "threshold_percent": 80,
+  "warning_cooldown_minutes": 5,
+  "max_context_tokens": 200000,
+  "chars_per_token": 4
+}
