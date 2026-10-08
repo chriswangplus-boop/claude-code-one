@@ -17,8 +17,31 @@
         "name": "chriswangplus-boop"
       },
       "license": "MIT",
-      "keywords": ["context", "monitor", "memory", "compact", "usage"],
+      "keywords": [
+        "context",
+        "monitor",
+        "memory",
+        "compact",
+        "usage"
+      ],
       "category": "productivity"
+    },
+    {
+      "name": "glm-toolkit",
+      "source": "./plugins/glm-toolkit",
+      "description": "Safely switch Claude Code between Claude and Z.AI GLM-5.3, and tune GLM sessions.",
+      "version": "2.0.0",
+      "author": {
+        "name": "chriswangplus-boop"
+      },
+      "license": "MIT",
+      "keywords": [
+        "glm",
+        "glm-5.3",
+        "z.ai",
+        "model-switch"
+      ],
+      "category": "development"
     }
   ]
 }

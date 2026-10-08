@@ -1,0 +1,8 @@
+{
+  "name": "glm-toolkit",
+  "description": "Switch Claude Code between Claude and Z.AI GLM-5.3 safely (glm-model-switch) and tune GLM-5.3 sessions (glm-optimizer).",
+  "version": "2.0.0",
+  "author": { "name": "chriswangplus-boop" },
+  "license": "MIT",
+  "keywords": ["glm", "glm-5.3", "z.ai", "model-switch"]
+}

@@ -1,0 +1,84 @@
+<svg viewBox="0 0 760 560" xmlns="http://www.w3.org/2000/svg" role="img" font-family="ui-sans-serif, system-ui, sans-serif">
+  <title>glm-optimizer skill overview</title>
+  <desc>How the glm-optimizer skill triggers in a GLM-5.3 Claude Code session, its six operating pillars, its two reference files, and the outcome.</desc>
+
+  <rect x="0" y="0" width="760" height="560" fill="#ffffff"/>
+
+  <!-- ===== Tier 1: triggers ===== -->
+  <text x="380" y="22" text-anchor="middle" font-size="15" font-weight="600" fill="#1a1a1a">glm-optimizer — how it works</text>
+
+  <rect x="60" y="42" width="300" height="58" rx="8" fill="none" stroke="#8a8a8a"/>
+  <text x="210" y="66" text-anchor="middle" font-size="13" font-weight="600" fill="#1a1a1a">GLM session check (§0)</text>
+  <text x="210" y="86" text-anchor="middle" font-size="11.5" fill="#555555" font-family="ui-monospace, monospace">ANTHROPIC_BASE_URL = api.z.ai</text>
+
+  <rect x="400" y="42" width="300" height="58" rx="8" fill="none" stroke="#8a8a8a"/>
+  <text x="550" y="66" text-anchor="middle" font-size="13" font-weight="600" fill="#1a1a1a">CLAUDE.md hook</text>
+  <text x="550" y="86" text-anchor="middle" font-size="11.5" fill="#555555">instructs Claude to apply profile</text>
+
+  <line x1="210" y1="100" x2="210" y2="124" stroke="#8a8a8a" stroke-width="1.5"/>
+  <line x1="550" y1="100" x2="550" y2="124" stroke="#8a8a8a" stroke-width="1.5"/>
+  <polygon points="205,122 215,122 210,132" fill="#8a8a8a"/>
+  <polygon points="545,122 555,122 550,132" fill="#8a8a8a"/>
+
+  <!-- ===== Tier 2: the operating profile ===== -->
+  <rect x="40" y="134" width="680" height="230" rx="10" fill="none" stroke="#8a8a8a" stroke-width="1.5"/>
+  <text x="380" y="158" text-anchor="middle" font-size="13.5" font-weight="600" fill="#b3560e">SKILL.md — operating profile for GLM-5.3</text>
+
+  <g font-size="12.5">
+    <rect x="60" y="176" width="208" height="72" rx="8" fill="none" stroke="#c4c4c4"/>
+    <text x="164" y="200" text-anchor="middle" font-weight="600" fill="#1a1a1a">Clean terminal output</text>
+    <text x="164" y="219" text-anchor="middle" font-size="11" fill="#555555">answer first, no filler</text>
+    <text x="164" y="235" text-anchor="middle" font-size="11" fill="#555555">every file change named</text>
+
+    <rect x="276" y="176" width="208" height="72" rx="8" fill="none" stroke="#c4c4c4"/>
+    <text x="380" y="200" text-anchor="middle" font-weight="600" fill="#1a1a1a">Inline Unicode diagrams</text>
+    <text x="380" y="219" text-anchor="middle" font-size="11" fill="#555555">flows, trees, decisions</text>
+    <text x="380" y="235" text-anchor="middle" font-size="11" font-family="ui-monospace, monospace" fill="#555555">┌─┐ ├─▶ └─┘ in-terminal</text>
+
+    <rect x="492" y="176" width="208" height="72" rx="8" fill="none" stroke="#c4c4c4"/>
+    <text x="596" y="200" text-anchor="middle" font-weight="600" fill="#1a1a1a">Plan → Build → Verify</text>
+    <text x="596" y="219" text-anchor="middle" font-size="11" fill="#555555">verify is mandatory —</text>
+    <text x="596" y="235" text-anchor="middle" font-size="11" fill="#555555">evidence, not "should work"</text>
+
+    <rect x="60" y="262" width="208" height="72" rx="8" fill="none" stroke="#c4c4c4"/>
+    <text x="164" y="286" text-anchor="middle" font-weight="600" fill="#1a1a1a">Subagent strategy</text>
+    <text x="164" y="305" text-anchor="middle" font-size="11" fill="#555555">isolate search · parallelize</text>
+    <text x="164" y="321" text-anchor="middle" font-size="11" fill="#555555">else stay on 1M context</text>
+
+    <rect x="276" y="262" width="208" height="72" rx="8" fill="none" stroke="#b3560e" stroke-width="1.5"/>
+    <text x="380" y="286" text-anchor="middle" font-weight="600" fill="#b3560e">Full harness freedom</text>
+    <text x="380" y="305" text-anchor="middle" font-size="11" fill="#555555">tools over recall · skills first</text>
+    <text x="380" y="321" text-anchor="middle" font-size="11" fill="#555555">plugins &amp; MCP servers</text>
+
+    <rect x="492" y="262" width="208" height="72" rx="8" fill="none" stroke="#c4c4c4"/>
+    <text x="596" y="286" text-anchor="middle" font-weight="600" fill="#1a1a1a">Z.AI MCP tools</text>
+    <text x="596" y="305" text-anchor="middle" font-size="11" fill="#555555">Vision · Web Search</text>
+    <text x="596" y="321" text-anchor="middle" font-size="11" fill="#555555">Web Reader · Zread</text>
+  </g>
+
+  <!-- arrows to tier 3 -->
+  <line x1="210" y1="364" x2="210" y2="392" stroke="#8a8a8a" stroke-width="1.5"/>
+  <line x1="550" y1="364" x2="550" y2="392" stroke="#8a8a8a" stroke-width="1.5"/>
+  <polygon points="205,390 215,390 210,400" fill="#8a8a8a"/>
+  <polygon points="545,390 555,390 550,400" fill="#8a8a8a"/>
+  <text x="380" y="384" text-anchor="middle" font-size="10.5" fill="#888888">loaded on demand</text>
+
+  <!-- ===== Tier 3: references ===== -->
+  <g font-size="12.5">
+    <rect x="60" y="402" width="300" height="62" rx="8" fill="none" stroke="#c4c4c4"/>
+    <text x="210" y="426" text-anchor="middle" font-weight="600" font-family="ui-monospace, monospace" fill="#1a1a1a">terminal-formatting.md</text>
+    <text x="210" y="446" text-anchor="middle" font-size="11" fill="#555555">diagram pattern library · width rules</text>
+
+    <rect x="400" y="402" width="300" height="62" rx="8" fill="none" stroke="#c4c4c4"/>
+    <text x="550" y="426" text-anchor="middle" font-weight="600" font-family="ui-monospace, monospace" fill="#1a1a1a">glm-tuning.md</text>
+    <text x="550" y="446" text-anchor="middle" font-size="11" fill="#555555">/effort map · 1M setup · error codes</text>
+  </g>
+
+  <!-- arrow to outcome -->
+  <line x1="380" y1="464" x2="380" y2="490" stroke="#8a8a8a" stroke-width="1.5"/>
+  <polygon points="375,488 385,488 380,498" fill="#8a8a8a"/>
+
+  <!-- ===== Outcome ===== -->
+  <rect x="180" y="500" width="400" height="46" rx="8" fill="none" stroke="#b3560e" stroke-width="1.5"/>
+  <text x="380" y="528" text-anchor="middle" font-size="13" font-weight="600" fill="#b3560e">GLM output: correct, verified, scannable</text>
+</svg>
