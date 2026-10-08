@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 640" font-family="Helvetica, Arial, sans-serif">
+  <title>glm-model-switch v1.0.0 — architecture</title>
+  <desc>Prompt-driven, reversible Claude vs GLM provider switch for Claude Code with backups, prior-state restore, and verified atomic writes.</desc>
+  <rect x="0" y="0" width="860" height="640" fill="#F7F9FB"/>
+  <text x="430" y="38" text-anchor="middle" font-size="22" font-weight="bold" fill="#1C2E4A">glm-model-switch — safe Claude ↔ GLM switch</text>
+  <text x="430" y="60" text-anchor="middle" font-size="13" fill="#5A6B82">v1.2.0 · one script writes · backups in two independent locations</text>
+
+  <!-- User prompt -->
+  <rect x="320" y="84" width="220" height="52" rx="10" fill="#FFFFFF" stroke="#1C2E4A" stroke-width="1.5"/>
+  <text x="430" y="106" text-anchor="middle" font-size="15" font-weight="bold" fill="#1C2E4A">User prompt</text>
+  <text x="430" y="124" text-anchor="middle" font-size="12" fill="#5A6B82">"switch to GLM" · "back to Claude" · "status"</text>
+
+  <line x1="430" y1="136" x2="430" y2="166" stroke="#1C2E4A" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Skill router -->
+  <rect x="300" y="168" width="260" height="52" rx="10" fill="#FFFFFF" stroke="#1C2E4A" stroke-width="1.5"/>
+  <text x="430" y="190" text-anchor="middle" font-size="15" font-weight="bold" fill="#1C2E4A">SKILL.md intent routing</text>
+  <text x="430" y="208" text-anchor="middle" font-size="12" fill="#5A6B82">maps intent → one script command</text>
+
+  <line x1="430" y1="220" x2="430" y2="250" stroke="#1C2E4A" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Engine -->
+  <rect x="240" y="252" width="380" height="150" rx="12" fill="#EAF2EE" stroke="#3F8A6D" stroke-width="2"/>
+  <rect x="586" y="258" width="26" height="18" rx="4" fill="#3F8A6D"/>
+  <text x="599" y="271" text-anchor="middle" font-size="11" font-weight="bold" fill="#FFFFFF">&lt;/&gt;</text>
+  <text x="430" y="278" text-anchor="middle" font-size="15" font-weight="bold" fill="#1C2E4A">glm_switch.py — the only writer</text>
+  <text x="430" y="300" text-anchor="middle" font-size="12" fill="#33475F">status · to-glm · to-claude · setup-key · backups · restore</text>
+  <text x="430" y="326" text-anchor="middle" font-size="12" fill="#33475F">backup → record prior values → atomic write →</text>
+  <text x="430" y="344" text-anchor="middle" font-size="12" fill="#33475F">verify managed-keys-only invariant</text>
+  <text x="430" y="370" text-anchor="middle" font-size="12" font-weight="bold" fill="#B23A3A">verification fails → auto-rollback, no switch</text>
+  <text x="430" y="390" text-anchor="middle" font-size="11" fill="#5A6B82">Python 3 stdlib · fully offline · never touches login credentials</text>
+
+  <!-- Files row -->
+  <line x1="320" y1="402" x2="180" y2="452" stroke="#1C2E4A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="430" y1="402" x2="430" y2="452" stroke="#1C2E4A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="540" y1="402" x2="680" y2="452" stroke="#1C2E4A" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="60" y="454" width="240" height="72" rx="10" fill="#FFFFFF" stroke="#E06B10" stroke-width="1.5"/>
+  <text x="180" y="477" text-anchor="middle" font-size="14" font-weight="bold" fill="#1C2E4A">~/.claude/settings.json</text>
+  <text x="180" y="496" text-anchor="middle" font-size="12" fill="#5A6B82">only 7 managed env keys</text>
+  <text x="180" y="513" text-anchor="middle" font-size="12" fill="#5A6B82">ever written or restored</text>
+
+  <rect x="310" y="454" width="240" height="72" rx="10" fill="#FFFFFF" stroke="#3F8A6D" stroke-width="1.5"/>
+  <text x="430" y="477" text-anchor="middle" font-size="14" font-weight="bold" fill="#1C2E4A">Backups ×2 + baseline</text>
+  <text x="430" y="496" text-anchor="middle" font-size="12" fill="#5A6B82">primary in ~/.claude/</text>
+  <text x="430" y="513" text-anchor="middle" font-size="12" fill="#5A6B82">mirror in ~/.config/glm-switch/</text>
+
+  <rect x="560" y="454" width="240" height="72" rx="10" fill="#FFFFFF" stroke="#3F8A6D" stroke-width="1.5"/>
+  <text x="680" y="477" text-anchor="middle" font-size="14" font-weight="bold" fill="#1C2E4A">~/.config/glm-switch/</text>
+  <text x="680" y="496" text-anchor="middle" font-size="12" fill="#5A6B82">key.env (chmod 600)</text>
+  <text x="680" y="513" text-anchor="middle" font-size="12" fill="#5A6B82">state.json (prior values)</text>
+
+  <!-- Outcome -->
+  <line x1="180" y1="526" x2="380" y2="566" stroke="#1C2E4A" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="290" y="568" width="280" height="52" rx="10" fill="#1C2E4A"/>
+  <text x="430" y="590" text-anchor="middle" font-size="14" font-weight="bold" fill="#FFFFFF">Restart Claude Code → new provider</text>
+  <text x="430" y="608" text-anchor="middle" font-size="12" fill="#C9D4E2">Claude ↔ GLM-5.3 (api.z.ai/api/anthropic)</text>
+
+  <!-- Legend -->
+  <rect x="636" y="560" width="200" height="66" rx="8" fill="#FFFFFF" stroke="#C9D4E2"/>
+  <rect x="646" y="570" width="20" height="14" rx="3" fill="#3F8A6D"/>
+  <text x="672" y="581" font-size="11" fill="#33475F">&lt;/&gt; runs a local script</text>
+  <rect x="646" y="590" width="20" height="14" rx="3" fill="#FFFFFF" stroke="#E06B10" stroke-width="1.5"/>
+  <text x="672" y="601" font-size="11" fill="#33475F">surgically edited file</text>
+  <rect x="646" y="610" width="20" height="14" rx="3" fill="#FFFFFF" stroke="#3F8A6D" stroke-width="1.5"/>
+  <text x="672" y="621" font-size="11" fill="#33475F">safety artifacts (read/restore)</text>
+
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#1C2E4A"/>
+    </marker>
+  </defs>
+</svg>
