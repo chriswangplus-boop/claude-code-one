@@ -1,0 +1,11 @@
+{
+  "name": "model-routing-policy",
+  "version": "1.0.0",
+  "description": "Enforce your subagent routing policy: stamps the policy model and effort onto every Agent/Task dispatch, regardless of what a plugin or skill declares.",
+  "author": {
+    "name": "chriswangplus-boop"
+  },
+  "license": "MIT",
+  "keywords": ["routing", "model", "effort", "subagent", "policy"],
+  "category": "productivity"
+}

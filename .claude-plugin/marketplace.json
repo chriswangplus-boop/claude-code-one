@@ -19,6 +19,18 @@
       "license": "MIT",
       "keywords": ["context", "monitor", "memory", "compact", "usage"],
       "category": "productivity"
+    },
+    {
+      "name": "model-routing-policy",
+      "source": "./plugins/model-routing-policy",
+      "description": "Enforce your subagent routing policy: stamps the policy model and effort onto every Agent/Task dispatch, regardless of what a plugin or skill declares.",
+      "version": "1.0.0",
+      "author": {
+        "name": "chriswangplus-boop"
+      },
+      "license": "MIT",
+      "keywords": ["routing", "model", "effort", "subagent", "policy"],
+      "category": "productivity"
     }
   ]
 }
