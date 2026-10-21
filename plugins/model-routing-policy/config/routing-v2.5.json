@@ -1,0 +1,39 @@
+{
+  "policy": "routing v2.5",
+  "revised": "2026-10-21",
+  "tiers": {
+    "opus":   { "model_id": "claude-sonnet-5-5", "alias": "sonnet", "effort": "high" },
+    "sonnet": { "model_id": "claude-haiku-5-5",  "alias": "haiku",  "effort": "xhigh" },
+    "apex":   { "model_id": "claude-opus-5-5",   "alias": "opus",   "effort": "medium" }
+  },
+  "default_tier": "opus",
+  "apex": {
+    "cases": ["hardest", "strategy", "decision", "bugfix", "master-plan"],
+    "tag_eligible": ["general-purpose", "claude"]
+  },
+  "agents": {
+    "pge-orchestrator": "opus",
+    "planner": "apex",
+    "generator": "sonnet",
+    "evaluator": "opus",
+    "evaluator-standard": "opus",
+    "evaluator-quality": "opus",
+    "evaluator-strict": "opus",
+    "evaluator-godmode": "opus",
+    "evaluator-codex": "opus",
+    "evaluator-gemini": "opus",
+    "skillers-recommender": "opus",
+    "skillers-compactor": "sonnet",
+    "file-analyzer": "sonnet",
+    "page-writer": "sonnet",
+    "cuj-auditor": "opus",
+    "usability-auditor": "opus",
+    "cuj-author": "opus",
+    "Plan": "apex",
+    "general-purpose": "opus",
+    "claude": "opus",
+    "Explore": "sonnet",
+    "claude-code-guide": "sonnet",
+    "statusline-setup": "sonnet"
+  }
+}
