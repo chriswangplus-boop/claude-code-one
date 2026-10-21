@@ -1,0 +1,400 @@
+"""Ownership, sentinel validation, git snapshots/commits (never push), and secret scanning."""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Iterable
+
+from .errors import IntegrityError, SecretDetected
+from .util import sha256_file
+
+# --- ownership ------------------------------------------------------------
+
+HARNESS_OWNED = {
+    "STATE.json", "BATON.json", "PENDING_DECISION.md", "DECISIONS.md", "HEARTBEAT.json",
+    "config.json", "GOAL.md", "PAUSE", "STOP", "HALT", ".lock", ".run.pid",
+    "RULES_CLAUDE.md", "RULES_CODER.md",
+}
+CLAUDE_OWNED = {"PLAN.md", "HANDOFF.md", "REVIEW.md", "CLAUDE_DONE.json", "CHECKPOINT_planner.md", "CHECKPOINT_reviewer.md"}
+CODER_OWNED = {"CODER_REPORT.md", "CODER_DONE.json", "CHECKPOINT_coder.md"}
+
+IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", ".tox", "dist", "build", ".DS_Store"}
+IGNORED_PREFIXES = (
+    ".relay/journal/", ".relay/monitor/", ".relay/answers/", ".relay/calibration/",
+    ".relay/CALIBRATION_",
+)
+IGNORED_FILES = {
+    ".relay/.lock", ".relay/.run.pid", ".relay/.run.lock", ".relay/STATE.json",
+    ".relay/BATON.json", ".relay/HEARTBEAT.json", ".relay/relay.log",
+    ".relay/PAUSE", ".relay/STOP", ".relay/HALT",
+}
+IGNORED_SUFFIXES = (".tmp", ".swp", ".pyc", ".log")
+
+
+def relpath(path: str | Path, root: str | Path) -> str:
+    return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+
+
+def owner_of(rel: str) -> str:
+    """Who may write this path: coder | claude | harness | monitor."""
+    if not rel.startswith(".relay/"):
+        return "coder"
+    name = rel[len(".relay/"):]
+    if name in HARNESS_OWNED or name.startswith("journal/") or name.startswith("answers/"):
+        return "harness"
+    if name in CLAUDE_OWNED:
+        return "claude"
+    if name in CODER_OWNED:
+        return "coder"
+    if name == "MONITOR_NOTES.md" or name.startswith("monitor/"):
+        return "monitor"
+    return "harness"
+
+
+def _is_ignored(rel: str) -> bool:
+    if rel in IGNORED_FILES or rel.endswith(IGNORED_SUFFIXES):
+        return True
+    return any(rel.startswith(prefix) for prefix in IGNORED_PREFIXES)
+
+
+def iter_watch_files(root: Path) -> Iterable[tuple[str, Path]]:
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS)
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            try:
+                rel = path.resolve().relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if _is_ignored(rel):
+                continue
+            try:
+                if path.stat().st_size > 10 * 1024 * 1024:
+                    continue
+            except OSError:
+                continue
+            yield rel, path
+
+
+def snapshot(root: str | Path) -> dict[str, str]:
+    """sha256 of every watched file (source + agent-authored .relay files)."""
+    out: dict[str, str] = {}
+    for rel, path in iter_watch_files(Path(root)):
+        try:
+            out[rel] = sha256_file(path)
+        except OSError:
+            continue
+    return out
+
+
+def changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    keys = set(before) | set(after)
+    return sorted(key for key in keys if before.get(key) != after.get(key))
+
+
+def ownership_violations(
+    before: dict[str, str], after: dict[str, str], actor: str
+) -> list[dict[str, Any]]:
+    """Which changed files were written by someone other than `actor`."""
+    if actor == "human":
+        return []
+    violations = []
+    for rel in changed_paths(before, after):
+        owner = owner_of(rel)
+        if owner == "monitor":
+            continue  # the independent monitor may write notes at any time
+        if owner != actor:
+            violations.append({"path": rel, "writer": actor, "owner": owner})
+    return violations
+
+
+# --- sentinels ------------------------------------------------------------
+
+ALLOWED_STATUS = {"done", "blocked", "needs_decision"}
+ALLOWED_VERDICTS = {"APPROVED", "CHANGES_REQUESTED", "MILESTONE_DONE", "PROJECT_DONE"}
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def read_sentinel(path: Path) -> dict:
+    import json
+
+    if not path.exists():
+        raise IntegrityError(f"sentinel not found: {path.name}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise IntegrityError(f"{path.name} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise IntegrityError(f"{path.name} must contain a JSON object")
+    return data
+
+
+def validate_sentinel(
+    sentinel: dict,
+    *,
+    root: str | Path,
+    expected_round: int,
+    expected_role: str,
+    expected_file: str,
+    round_started_wall: float,
+    mtime_tolerance: float = 2.0,
+) -> list[str]:
+    """Return a list of problems; an empty list means the sentinel may be trusted."""
+    issues: list[str] = []
+    root = Path(root).resolve()
+
+    try:
+        round_no = int(sentinel.get("round"))
+    except (TypeError, ValueError):
+        round_no = None
+    if round_no != expected_round:
+        issues.append(f"round is {sentinel.get('round')!r}, expected {expected_round}")
+
+    role = str(sentinel.get("role", ""))
+    if role != expected_role:
+        issues.append(f"role is {role!r}, expected {expected_role}")
+
+    status = sentinel.get("status")
+    if status not in ALLOWED_STATUS:
+        issues.append(f"status is {status!r}")
+
+    verdict = sentinel.get("verdict")
+    if verdict is not None and verdict not in ALLOWED_VERDICTS:
+        issues.append(f"verdict is {verdict!r}")
+    is_checkpoint = os.path.normpath(str(sentinel.get("file") or "")).replace("\\", "/").startswith(".relay/CHECKPOINT_")
+    if expected_role == "reviewer" and status == "done" and verdict not in ALLOWED_VERDICTS and not is_checkpoint:
+        issues.append("reviewer sentinel needs a verdict")
+
+    ctx = sentinel.get("context_estimate_pct")
+    if ctx is not None:
+        try:
+            ctx_float = float(ctx)
+            if not 0 <= ctx_float <= 100:
+                issues.append(f"context_estimate_pct out of range: {ctx}")
+        except (TypeError, ValueError):
+            issues.append(f"context_estimate_pct is not a number: {ctx!r}")
+
+    summary = sentinel.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        issues.append("summary is missing")
+
+    if status == "needs_decision" and not str(sentinel.get("question") or "").strip():
+        issues.append("needs_decision without a question")
+
+    announced = str(sentinel.get("file") or "")
+    if not announced:
+        issues.append("file is missing")
+    else:
+        if Path(announced).is_absolute():
+            issues.append("file must be project-relative")
+        normalized = os.path.normpath(announced).replace("\\", "/")
+        if normalized.startswith("../") or "/../" in normalized:
+            issues.append("file escapes the project folder")
+        if normalized != os.path.normpath(expected_file).replace("\\", "/"):
+            issues.append(f"announces {announced!r}, expected {expected_file!r}")
+        target = root / normalized
+        if not target.exists():
+            issues.append(f"announced file does not exist: {normalized}")
+        else:
+            digest = str(sentinel.get("sha256") or "")
+            if not SHA256.match(digest):
+                issues.append("sha256 is missing or malformed")
+            elif sha256_file(target) != digest:
+                issues.append("sha256 does not match the announced file")
+            if target.stat().st_mtime + mtime_tolerance < round_started_wall:
+                issues.append("announced file predates this round")
+
+    sentinel_path = root / ".relay" / ("CODER_DONE.json" if expected_role == "coder" else "CLAUDE_DONE.json")
+    if sentinel_path.exists() and sentinel_path.stat().st_mtime + mtime_tolerance < round_started_wall:
+        issues.append("sentinel predates this round (stale)")
+
+    return issues
+
+
+# --- git ------------------------------------------------------------------
+
+def _git(root: Path, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True, text=True, timeout=timeout, check=False,
+    )
+
+
+def is_git_repo(root: str | Path) -> bool:
+    try:
+        return _git(Path(root), ["rev-parse", "--is-inside-work-tree"]).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def git_init(root: str | Path) -> bool:
+    root = Path(root)
+    if is_git_repo(root):
+        return False
+    result = _git(root, ["init"])
+    if result.returncode != 0:
+        raise IntegrityError(f"git init failed: {result.stderr.strip()}")
+    return True
+
+
+def git_snapshot(root: str | Path) -> list[str]:
+    if not is_git_repo(root):
+        return []
+    result = _git(Path(root), ["status", "--porcelain"])
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _identity_args(root: Path) -> list[str]:
+    try:
+        email = _git(root, ["config", "user.email"]).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        email = ""
+    if email:
+        return []
+    return ["-c", "user.name=relay", "-c", "user.email=relay@localhost"]
+
+
+def git_add(root: str | Path, paths: Iterable[str]) -> None:
+    root = Path(root)
+    items = [p for p in paths if p]
+    if not items:
+        return
+    result = _git(root, ["add", "--", *items])
+    if result.returncode != 0:
+        raise IntegrityError(f"git add failed: {result.stderr.strip()}")
+
+
+def git_commit(root: str | Path, message: str, add_all: bool = True) -> str | None:
+    """Stage and commit. Returns the commit hash, or None when there was nothing to commit.
+
+    There is deliberately no push helper in Relay.
+    """
+    root = Path(root)
+    if not is_git_repo(root):
+        return None
+    if add_all:
+        added = _git(root, ["add", "-A"])
+        if added.returncode != 0:
+            raise IntegrityError(f"git add failed: {added.stderr.strip()}")
+    staged = _git(root, ["diff", "--cached", "--quiet"])
+    if staged.returncode == 0:
+        return None
+    staged_files = [
+        line for line in _git(root, ["diff", "--cached", "--name-only"]).stdout.splitlines() if line.strip()
+    ]
+    hits = secret_scan(root, staged_files)
+    if hits:
+        summary = ", ".join(f"{h['path']}:{h['line']} ({h['rule']})" for h in hits[:5])
+        raise SecretDetected(f"secret scan blocked the commit: {summary}")
+    result = _git(root, [*_identity_args(root), "commit", "-m", message])
+    if result.returncode != 0:
+        raise IntegrityError(f"git commit failed: {result.stderr.strip()}")
+    head = _git(root, ["rev-parse", "HEAD"]).stdout.strip()
+    return head or None
+
+
+# --- secret scanning ------------------------------------------------------
+
+SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
+    ("private_key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("github_token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b")),
+    ("github_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
+    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("api_key", re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b")),
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+    ("bearer", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}")),
+    ("assigned_secret", re.compile(
+        r"(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)\b"
+        r"\s*[:=]\s*[\"']?([^\s\"'#]{8,})"
+    )),
+    ("env_secret", re.compile(
+        r"(?m)^[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*(\S+)"
+    )),
+]
+
+_PLACEHOLDER = re.compile(
+    r"(?i)(?:your[_-]?|example|placeholder|changeme|redacted|\[secret\]|<[^>]*>|\$\{|\$\(|os\.environ|none|null|true|false)"
+)
+TEXT_SUFFIXES = {".py", ".md", ".json", ".txt", ".toml", ".yaml", ".yml", ".sh", ".bash", ".zsh", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".sql", ".rb", ".go", ".rs", ".java", ".c", ".h", ".cpp", ".env", ".ini", ".cfg", ".conf"}
+MAX_SCAN_BYTES = 2 * 1024 * 1024
+
+
+def _looks_text(path: Path) -> bool:
+    if path.suffix.lower() in TEXT_SUFFIXES or path.name.startswith(".env"):
+        return True
+    try:
+        chunk = path.read_bytes()[:4096]
+    except OSError:
+        return False
+    return b"\x00" not in chunk
+
+
+def _scan_text(text: str) -> list[tuple[str, int]]:
+    hits: list[tuple[str, int]] = []
+    for rule, pattern in SECRET_RULES:
+        for match in pattern.finditer(text):
+            candidate = match.group(match.lastindex or 0)
+            if _PLACEHOLDER.search(candidate):
+                continue
+            if rule in {"api_key", "assigned_secret", "env_secret"} and len(candidate) < 8:
+                continue
+            line = text.count("\n", 0, match.start()) + 1
+            hits.append((rule, line))
+    return hits
+
+
+def secret_scan(root: str | Path, paths: Iterable[str] | None = None) -> list[dict[str, Any]]:
+    """Scan project files (or a given subset) for credentials. Never returns the secret itself."""
+    root = Path(root)
+    if paths is None:
+        candidates = list(iter_watch_files(root))
+    else:
+        candidates = []
+        for rel in paths:
+            if _is_ignored(rel):
+                continue
+            path = root / rel
+            if path.is_file():
+                candidates.append((rel, path))
+    hits: list[dict[str, Any]] = []
+    for rel, path in candidates:
+        try:
+            if path.stat().st_size > MAX_SCAN_BYTES or not _looks_text(path):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for rule, line in _scan_text(text):
+            hits.append({"path": rel, "rule": rule, "line": line})
+    return hits
+
+
+def assert_no_secrets(root: str | Path, paths: Iterable[str] | None = None) -> None:
+    hits = secret_scan(root, paths)
+    if hits:
+        summary = ", ".join(f"{h['path']}:{h['line']} ({h['rule']})" for h in hits[:5])
+        raise SecretDetected(f"secret scan blocked the turn: {summary}")
+
+
+# --- screens retention ----------------------------------------------------
+
+def prune_screens(screens_dir: Path, retention_days: int, now: float | None = None) -> list[Path]:
+    if retention_days <= 0 or not screens_dir.exists():
+        return []
+    cutoff = (now if now is not None else time.time()) - retention_days * 86400
+    removed = []
+    for path in screens_dir.rglob("*"):
+        if path.is_file() and path.stat().st_mtime < cutoff:
+            try:
+                path.unlink()
+                removed.append(path)
+            except OSError:
+                pass
+    return removed

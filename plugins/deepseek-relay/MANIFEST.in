@@ -1,0 +1,4 @@
+include README.md
+include config/defaults.json
+recursive-include prompts *.md
+recursive-include docs *.md
