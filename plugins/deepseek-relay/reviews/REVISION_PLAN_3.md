@@ -4,13 +4,12 @@
 - Codex's `CODEX_PLAN.md`, kept verbatim in this folder.
 - Claude's `CLAUDE_REVIEW_3.md`.
 
-This plan **adopts Codex's direction**, Codex desktop as a switchable supervisor, and changes it
-in four places:
-1. The order of work: repairs first, then a simpler first version of switching.
-2. How Codex chooses its effort level.
-3. Where the one-time code is shown, because an agent with computer use could read it on screen.
-4. Two facts this plan can't confirm: the model name and the Codex routing policy. The human must
-   supply them.
+This plan **adopts Codex's direction**, Codex desktop as a switchable supervisor, with three
+changes:
+1. The order of work: repairs come first, then a simpler first version of switching.
+2. Where the one-time code is shown, because an agent with computer use could read it on screen.
+3. The human's answers of 2026-10-21 on the model, the routing policy, the High assessment and
+   switching (Part 4).
 
 **Ground rules (unchanged):**
 - `BUILD_PLAN.md` holds unless this file changes it.
@@ -100,6 +99,18 @@ relay switch --to claude
   - retry the same phase in a fresh session on the target backend, with a new `attempt_id` and
     the **original** signed baseline;
   - fixer file limits are counted across both attempts.
+- **Before any switch, verify that the outgoing app has stopped writing.** Both of these must
+  hold:
+  1. No file in the project has changed for a quiet period (default 60 s, measured with
+     snapshots).
+  2. The app shows idle, read through Accessibility or vision.
+
+  If either can't be established, the switch stays pending and Relay asks the human.
+- **Incomplete changes are always preserved.** If their safety can't be established, the loop
+  stays blocked until the human resolves them. Safety means passing the ownership check, the
+  git-control check and the secret scan against the original signed baseline.
+- **An active Zcode coding turn always finishes, and is validated, before the supervisor
+  changes.**
 - **The replacement session** is seeded from the plans, reviews, reports and decisions, plus a
   harness-written `HANDOVER.md`. It never needs the quota-limited app to write a checkpoint.
 - **A usage-limit message** always pauses and notifies. There's no automatic fallback and no
@@ -120,50 +131,70 @@ relay switch --to claude
 
 ## Part 4 — Choosing Codex's model and effort, and showing status
 
-### Confirm with the human before writing code
-1. **The model name.** Codex's plan pins `gpt-6.1-sol`. This plan couldn't verify that name. Use
-   it only if the Codex app shows exactly that label during calibration. Otherwise pause and ask.
-2. **The routing policy.** Codex's plan says "use your canonical GPT Routing v3.0 policy". That
-   document isn't in this repo, so DeepSeek can't follow it. **The human must add it** as
-   `docs/CODEX_ROUTING.md`. Relay records its version and sha256 in every Codex turn.
+### Human decisions (2026-10-21)
+1. **The model.** The installed Codex model metadata lists display name `GPT-6.1-Sol` and
+   identifier `gpt-6.1-sol`, and the local Codex configuration selects that identifier.
+   - Pin `gpt-6.1-sol`.
+   - During calibration, read the label the Codex picker actually shows. If it isn't
+     `GPT-6.1-Sol`, pause and ask the human. Nobody has inspected the live picker yet.
+2. **The routing policy.**
+   - Bundle the full **GPT Routing v3.0** instructions, plus `routing-policy.json` (on the
+     human's Mac at `~/.codex/routing-policy.json`), into `docs/codex-routing/`. DeepSeek copies
+     them on the Mac.
+   - Record the policy version and the sha256 of each file in `docs/codex-routing/MANIFEST.json`.
+     Every Codex turn's journal event also carries the version and those hashes.
+   - **If the policy files are missing, or their hashes don't match the manifest, Relay refuses
+     to run Codex as supervisor and reports the missing policy.** It never substitutes Claude's
+     routing rules.
+3. **Before every High turn, run a separate High qualification assessment.** The human chose
+   this extra check.
+4. **Version-1 switching** (between turns and at quota stops) is enough. Part 3 adds the human's
+   extra requirements.
 
-### Default rules if the human doesn't supply a policy (recommended)
-These mirror the Claude policy the human already approved, so there's one mental model:
-- **Medium** for all substantive planning, review, strategy and fix work. A first plan or a
-  repeated failure does not authorize High by itself.
-- **Low** only for harness-generated mechanical prompts: seeds, nudges and handover reading.
-- **High** only by the same deterministic triggers as Opus:
-  - first master plan;
-  - Sonnet/Medium re-plan failed;
-  - hardest-bug streak of 4, or blocked twice.
+### Effort routing for Codex (as the bundled policy defines it)
+- **Medium** is used for substantive planning, review, strategy, fixes and coordination. A first
+  plan or a repeated failure does not authorize High by itself.
+- **Low** is used only for bounded mechanical work that passes the policy's checks. Harness seeds,
+  nudges and handover reading are candidates.
+- **High** requires a qualification that passed, as defined below.
 
-  High has its own limits (default 1 per milestone and 3 per day), and Relay asks the human when
-  a limit is reached.
+### High qualification assessment
+1. **When a High trigger fires** (the same deterministic triggers as Opus: first master plan,
+   failed Medium re-plan, hardest-bug streak of 4, or blocked twice), Relay first runs a
+   **separate Medium assessment turn**.
+   - It is counted and journaled as `model.assessment`.
+   - It writes `.relay/HIGH_QUALIFICATION.json`.
+2. **`HIGH_QUALIFICATION.json` contains:**
+   - the verdict: `QUALIFIED` or `NOT_QUALIFIED`;
+   - **exactly one** permitted category from the bundled policy;
+   - concrete difficulty evidence;
+   - the bounded task scope;
+   - the sha256 of every input file it relied on;
+   - the `assignment_id` it applies to.
+3. **Relay validates the file deterministically:**
+   - the schema;
+   - the category must be in the policy;
+   - the input hashes must still match the files on disk;
+   - the `assignment_id` must equal the pending one.
+4. **A passing qualification is bound to one assignment and used once.** Relay journals it as
+   consumed, and any later work is classified again.
+5. **The turn stays at Medium** if the qualification is missing, `NOT_QUALIFIED`, stale (input
+   hashes changed), malformed, or for a different scope.
+6. **High still counts toward its limits** (default 1 per milestone and 3 per day). When a limit
+   is reached, Relay asks the human, as with Opus.
+7. **Nested Codex agents follow the same rules.** Relay records the *requested* model and effort
+   separately from what it *observed*. Anything Relay can't observe is journaled as `unverified`.
 
-### Codex's alternative: a High qualification gate
-Before every High turn, run a separately counted Medium assessment. It returns `QUALIFIED` or
-`NOT_QUALIFIED`, together with:
-- the category;
-- evidence;
-- the scope;
-- hashes of its inputs.
-
-Each assessment is used once.
-
-This plan **does not** build that by default. It adds a model turn before every escalation, so
-it costs tokens, and it adds a second judgment path. Build it only if the human chooses it
-(question 3 below).
-
-### Both options
-- Record the *requested* model and effort separately from what was *observed* on screen. If the
-  observation can't be made, journal it as `unverified`.
+### Status and monitoring
 - Claude's model policy and Zcode's configuration stay unchanged.
 - The monitor covers every supervisor role on both backends.
-- `relay status --json` and Relay Watch show, all read from the journal and state:
+- `relay status --json` and Relay Watch show the following, all read from the journal and
+  state:
   - the active backend;
   - any pending switch;
   - usage-limit pauses;
-  - separate Claude Opus counters and Codex High counters.
+  - the policy version;
+  - Claude Opus counters and Codex High counters, plus assessment counts, kept separate.
 
 ---
 
@@ -183,7 +214,16 @@ Adopted from Codex's plan §5:
    - unverified model or effort;
    - the app isn't running;
    - a replayed switch record.
-4. Effort-routing tests for whichever option the human chooses.
+4. Effort-routing tests:
+   - Low is allowed only where the policy allows it.
+   - High needs a fresh `QUALIFIED` assessment that is used once.
+   - The turn stays at Medium when the assessment is missing, `NOT_QUALIFIED`, stale (changed
+     input hashes), malformed, or for a different scope.
+   - The policy files are missing or their hashes don't match → Codex supervisor refused, and
+     no Claude-rule fallback.
+   - The live picker label differs from `GPT-6.1-Sol` → pause.
+   - Switching waits for the quiet period, keeps incomplete changes, and blocks while their
+     safety is unknown.
 5. The full Python and Swift suites, plus `pyflakes`.
 6. Human-assisted pilot on macOS 27.2:
    - calibrate Claude, Codex and Zcode;
@@ -200,11 +240,6 @@ Adopted from Codex's plan §5:
 
 ---
 
-## Questions for the human (answer before Part 4)
-1. Is Codex's model really `gpt-6.1-sol`? What exact label does the Codex app show?
-2. Will you add the "GPT Routing v3.0" policy text to the repo? Otherwise Relay uses the default
-   rules above, which mirror the Claude policy.
-3. Do you want Codex's separate "High qualification" assessment turn? It's stricter but costs an
-   extra Medium turn before every High.
-4. Is version-1 switching (at safe points and on quota stops) enough to start? Mid-turn stop
-   would come later.
+## Decisions recorded
+The four questions were answered by the human on 2026-10-21. See Part 4, "Human decisions", and
+the switching rules in Part 3. If a new question comes up while building, stop and ask.
