@@ -38,129 +38,192 @@ Done when: all of `CLAUDE_REVIEW.md` is fixed or explicitly deferred with a reas
 
 ---
 
-## Part B — model policy: Sonnet by default, Opus only when it earns it
+## Part B — model policy: Sonnet by default, Opus only when really necessary
 
-### Goal
-Long relay loops use a lot of Claude tokens. The planner and reviewer should run on
-**Sonnet 5.5 at high effort** almost all the time. **Opus 5.5 at medium effort** is used only for:
-1. **Critical strategy:** the first master plan and re-plans after the loop gets stuck.
-2. **The hardest fixes:** when GLM has failed the same problem repeatedly, Opus diagnoses it and
-   writes an exact fix plan, and GLM implements it.
+### Goal and the human's decisions (2026-10-21)
+Long relay loops use a lot of Claude tokens. The human decided:
+1. **GLM does the fixing.** By default every fix is implemented by GLM in Zcode, following the
+   reviewer's feedback or a written fix plan. **Only the hardest bugs** are fixed by Opus
+   directly.
+2. **Opus only when really necessary.** Everything else runs on **Sonnet 5.5 at high effort**.
+   That covers planning, milestone handoffs, reviews and fix plans. **Opus 5.5 at medium effort**
+   is the exception, and every use of it must be justified by a rule in B2.
 
 Relay can't see Claude subscription token counts, so the saving is not measured in tokens.
-Instead, the journal records which model ran every turn, so the share of Opus turns is visible
+Instead, the journal records which model ran every turn and why, so the Opus share is visible
 (Part C shows it).
 
-### B1. Roles and default models
+### B1. Roles
 
-| Role | Default model | Writes | When it runs |
-|---|---|---|---|
-| `planner` | **Sonnet 5.5 (high)** | `PLAN.md`, `HANDOFF.md` | Normal milestone handoffs |
-| `strategist` (new) | **Opus 5.5 (medium)** | `PLAN.md`, `HANDOFF.md`, `STRATEGY.md` | Escalation only (B2) |
-| `reviewer` | **Sonnet 5.5 (high)** | `REVIEW.md` | Every review |
-| `fixer` (new) | **Opus 5.5 (medium)** | `FIX_PLAN.md`, `HANDOFF.md` | Escalation only (B2) |
-| `coder` | GLM 5.3 flash (high), in Zcode | Source code, `CODER_REPORT.md` | Unchanged |
+| Role | Model | App | May write | When it runs |
+|---|---|---|---|---|
+| `planner` | **Sonnet 5.5 (high)** | Claude | `PLAN.md`, `HANDOFF.md` | All normal planning, including milestone handoffs and the first re-plan after a stall |
+| `reviewer` | **Sonnet 5.5 (high)** | Claude | `REVIEW.md`, `FIX_PLAN.md` | Every review; also writes a fix plan when an issue repeats (B2 ladder, step 2) |
+| `strategist` | **Opus 5.5 (medium)** | Claude | `PLAN.md`, `HANDOFF.md`, `STRATEGY.md` | Only by a B2 rule: the first master plan, or after a Sonnet re-plan has also failed |
+| `fixer` | **Opus 5.5 (medium)** | Claude | **source files** (within limits), `FIX_REPORT.md`, `HANDOFF.md` | Only the hardest bugs (B2 ladder, step 3) |
+| `coder` | GLM 5.3 flash (high) | Zcode | source files, `CODER_REPORT.md` | All other code changes |
 
-- **The fixer does not edit source code.** Source stays coder-owned, so the ownership model in
-  `integrity.py` doesn't change. The fixer writes a precise diagnosis and step-by-step fix in
-  `FIX_PLAN.md`, then points `HANDOFF.md` at it. GLM implements it in the next CODE turn.
-- **New ownership entries:**
-  - `STRATEGY.md` and `FIX_PLAN.md` are owned by Claude; add them to `CLAUDE_OWNED`.
-  - Add `CHECKPOINT_strategist.md` and `CHECKPOINT_fixer.md` the same way.
-- **Prompts:** add `strategist` and `fixer` sections to `RULES_CLAUDE.md`.
-  - The fixer's section says: "Diagnose the root cause from `CODER_REPORT.md`, `REVIEW.md`, the
-    git diff and the failing tests. Write `FIX_PLAN.md` with exact files, functions and steps,
-    plus the test that proves the fix. Do not edit source files."
+Ownership changes in `integrity.py`:
+- `FIX_PLAN.md` is owned by Claude (the reviewer writes it). Add `STRATEGY.md`, `FIX_REPORT.md`,
+  `CHECKPOINT_strategist.md` and `CHECKPOINT_fixer.md` to `CLAUDE_OWNED`.
+- **Source files are owned by the role that holds the baton.** That is the `coder` normally, and
+  the `fixer` only during a fixer turn. Pass the active role, not just the app, to
+  `ownership_violations`.
+- **Fixer limits:**
+  - A fixer turn may change at most `model_policy.fixer_max_files` source files (default
+    **10**). Exceeding that is an ownership violation and pauses the loop.
+  - It may not touch `.relay/` files other than `FIX_REPORT.md`, `HANDOFF.md` and its sentinel.
+  - The secret scan and the "never push" rule apply unchanged.
+
+Prompts (`RULES_CLAUDE.md`):
+- **`reviewer` section:**
+  - Add `blocking_issue_ids` (see B2).
+  - When the pointer says `write FIX_PLAN.md`, write the exact files, functions, steps and the
+    test that proves the fix, for GLM to implement.
+- **`strategist` section:** re-think the approach. Write `STRATEGY.md` with the reasoning, then
+  update `PLAN.md` and `HANDOFF.md`. Do not edit source.
+- **`fixer` section:**
+  - Fix only the issues named in the pointer.
+  - Make the smallest change that fixes the root cause, and add or adjust the test that proves
+    it.
+  - Run the tests.
+  - Write `FIX_REPORT.md` covering the root cause, the files changed and the test results.
+  - Do not refactor or start new work.
 
 ### B2. When Opus is used (decided by code, never by the LLM)
 
-The escalation decision is a **deterministic function**, `relay/model_policy.py::choose_model(state, phase, cfg)`.
-DeepSeek may *suggest* an escalation by setting a `suggest_escalation` flag in its route
-judgment. That suggestion only counts as one trigger among the rules below and is journaled. It
-can never pick a model by itself.
+The decision is a **deterministic function**:
+`relay/model_policy.py::choose_turn(state, phase, cfg) -> (role, model, effort, trigger)`.
+- DeepSeek's routing judgment may include `suggest_escalation`. That suggestion is **journaled
+  only and is never a trigger**.
+- The monitor may request a re-plan. That request counts as a stall, which starts at step 1 of
+  the re-plan path below.
 
-| Trigger | Role used | Default |
-|---|---|---|
-| First PLAN turn of the project (no `PLAN.md` yet) | `strategist` (Opus) | on |
-| A re-plan caused by stall detection (`stall.detected`), DeepSeek `STUCK`, or a monitor `replan` correction | `strategist` (Opus) | on |
-| Same problem not fixed after **N** consecutive `CHANGES_REQUESTED` (default N=2), or the coder reports `blocked` twice in a row | `fixer` (Opus), then back to CODE | on |
-| Human asks: `relay instruct --opus "…"` or a decision answer chooses "Use Opus" | Whichever of strategist/fixer fits the phase | on |
-| Everything else (milestone handoffs after `MILESTONE_DONE`, all reviews) | `planner`/`reviewer` (Sonnet) | — |
+**Fix ladder for a repeated problem.** The "same problem" test is deterministic:
+- The reviewer lists `blocking_issue_ids` in `CLAUDE_DONE.json`: stable slugs such as
+  `["auth-token-expiry"]`.
+- `validate_sentinel` checks the list: each ID matches `^[a-z0-9-]{3,40}$`, at most 10 IDs.
+- An issue's **streak** is the number of consecutive reviews that list it.
 
-The "same problem" test is deterministic:
-- The reviewer writes a `blocking_issue_ids` list in `CLAUDE_DONE.json` (short stable slugs,
-  e.g. `["auth-token-expiry"]`).
-- An issue counts as repeated when it appears in N consecutive reviews.
-- Add `blocking_issue_ids` to the reviewer section of `RULES_CLAUDE.md`, and validate it in
-  `validate_sentinel` (list of `^[a-z0-9-]{3,40}$`, at most 10 entries).
+| Step | Condition | What happens | Model |
+|---|---|---|---|
+| 1 | Normal `CHANGES_REQUESTED` | GLM fixes from `REVIEW.md` | Sonnet reviews, GLM codes |
+| 2 | Streak reaches `fix_plan_after` (default **2**) | The reviewer also writes `FIX_PLAN.md`; GLM implements it | Sonnet |
+| 3 | **Hardest bug:** streak reaches `opus_fix_after` (default **4**, i.e. still failing after the fix plan), **or** the coder reports `blocked` twice in a row on the same issue | `fixer` turn: Opus fixes the code directly, then a normal Sonnet review | **Opus** |
+| 4 | Streak still grows after an Opus fix | Human decision (no second Opus fix for the same issue without approval) | — |
 
-**Limits that protect the budget** (config, checked by `choose_model`):
-- `model_policy.max_opus_turns_per_milestone` (default **2**)
-- `model_policy.max_opus_turns_per_day` (default **6**)
+**Re-plan path:**
 
-When a trigger fires but a limit is hit, escalate a **human decision** with these options:
-- "Allow one more Opus turn"
+| Step | Condition | Role | Model |
+|---|---|---|---|
+| — | First PLAN turn of the project (no `PLAN.md` yet) | `strategist` | **Opus** (`escalate_on_first_plan`, default on) |
+| 1 | First stall or re-plan in a milestone | `planner` | Sonnet |
+| 2 | A second stall in the same milestone, after the Sonnet re-plan | `strategist` | **Opus** |
+| 3 | A stall after the Opus re-plan | Human decision | — |
+
+**Human request:** `relay instruct --opus "…"`, or a decision answer that chooses "Use Opus",
+runs the role that fits the phase (`strategist` when planning, `fixer` when fixing). It counts
+toward the limits.
+
+**Limits** (config, checked by `choose_turn`):
+- `max_opus_turns_per_milestone`, default **1**. The first master plan does not count.
+- `max_opus_turns_per_day`, default **3**.
+
+If a rule fires but a limit is reached, ask the human with these options:
+- "Allow this Opus turn"
 - "Continue on Sonnet"
 - "Pause"
 
-Never silently fall back, and never silently go over the limit.
+Never silently fall back, and never silently go over a limit.
 
-**After an Opus turn**, the next Claude turn goes back to Sonnet automatically. Opus is not
-"sticky".
+**After every Opus turn, the next Claude turn is Sonnet again.** Opus is never "sticky".
 
 ### B3. Switching models in the Claude app
-- Pick the model at the start of every Claude turn (as now), and verify it by reading the model
-  label with vision. Fix P2-13 at the same time:
+- Pick the model at the start of every Claude turn, and verify it by reading the model label
+  with vision. Fix P2-13 at the same time:
   - `label_region` is required when calibrating the Claude app.
   - Confirm the picker opened before typing.
-  - An unverified model raises `HumanRequired`; it never continues silently.
-- Pick the effort level the same way when the app has an effort control. If it doesn't, journal
+  - An unverified model raises `HumanRequired`; nothing is typed.
+- Pick the effort level the same way if the app shows an effort control. Otherwise, journal
   `effort: "unverifiable"` once per session.
-- Session handling: each role (`planner`, `strategist`, `reviewer`, `fixer`) keeps its own seed
-  section and checkpoint file. Switching roles follows the checkpoint-then-new-chat rule (P2-8).
-  Because Opus turns are rare, a new chat for each Opus turn is acceptable and keeps Opus context
-  small, which also saves tokens.
+- Each role (`planner`, `reviewer`, `strategist`, `fixer`) has its own seed section and
+  checkpoint file.
+- Switching roles follows the checkpoint-then-new-chat rule (P2-8). Opus turns always use a
+  fresh chat seeded from files. That keeps Opus context, and therefore tokens, small.
+- The reviewer's pointer after a fixer turn tells it to read `FIX_REPORT.md` instead of
+  `CODER_REPORT.md`.
 
 ### B4. Journal and config changes (Part C depends on these)
-- `turn.start`, `turn.end` and `gui.model` events carry these `detail` fields:
-  - `model` (e.g. `"Sonnet 5.5"`)
-  - `effort` (e.g. `"high"`)
-  - `model_verified` (`true`, `false` or `"unverifiable"`)
-- Add a new event, `model.escalated`, with `detail`:
-  - `trigger` (`first_plan`, `stall`, `stuck`, `monitor_replan`, `repeated_issue`, `blocked_twice`
-    or `human`)
+- These events carry `model`, `effort`, `role` and `model_verified` (`true`, `false` or
+  `"unverifiable"`) in `detail`:
+  - every Claude `turn.start` and `turn.end`
+  - every `gui.model` event
+- New event `model.escalated`, with `detail`:
+  - `trigger`: one of `first_plan`, `replan_after_sonnet`, `hardest_bug_streak`,
+    `hardest_bug_blocked` or `human`
   - `role`
   - `issue_ids`
-  - `opus_turns_today`
-  - `opus_turns_milestone`
-- New config, replacing `planner_model`/`planner_effort`:
+  - `streak`
+  - `opus_turns_today` and `opus_turns_milestone`, each with its limit
+- New event `fix.plan_requested` (ladder step 2), with `detail`: `issue_ids` and `streak`.
+- Config. This replaces `planner_model`/`planner_effort`/`reviewer_model`/`reviewer_effort`:
   ```json
   "model_policy": {
-    "default": {"model": "Sonnet 5.5", "effort": "high"},
-    "escalated": {"model": "Opus 5.5", "effort": "medium"},
-    "repeat_issue_threshold": 2,
-    "max_opus_turns_per_milestone": 2,
-    "max_opus_turns_per_day": 6,
+    "default":   {"model": "Sonnet 5.5", "effort": "high"},
+    "escalated": {"model": "Opus 5.5",   "effort": "medium"},
     "escalate_on_first_plan": true,
-    "escalate_on_replan": true
+    "fix_plan_after": 2,
+    "opus_fix_after": 4,
+    "fixer_max_files": 10,
+    "max_opus_turns_per_milestone": 1,
+    "max_opus_turns_per_day": 3
   }
   ```
-- `relay status` (text and `--json`) shows the Opus turns used today and in this milestone, next
-  to their limits.
+- `relay status` (text and `--json`) shows `Opus today: x/3, this milestone: y/1`.
 
 ### B5. Tests for Part B
-1. A normal milestone runs every Claude turn on Sonnet/high.
-2. The first PLAN turn uses `strategist` on Opus/medium. The next PLAN after `MILESTONE_DONE` is
-   back on Sonnet.
-3. Two reviews with the same `blocking_issue_ids` lead to a `fixer` turn on Opus, then CODE.
-   The fixer touching a source file is an ownership violation.
-4. A stall re-plan uses `strategist`, and a monitor `replan` correction does too.
-5. Hitting `max_opus_turns_per_milestone` creates a decision with the three options, and no
-   Opus turn runs before the answer.
-6. A DeepSeek `suggest_escalation` alone, with no rule triggered, does **not** select Opus.
-7. Model verification fails → `HumanRequired`, and no pointer is typed.
-8. The journal carries `model`, `effort` and `model_verified` on every Claude `turn.start` and
-   `turn.end`.
+1. A normal milestone runs every Claude turn on Sonnet/high, including planning and reviews.
+2. The first PLAN turn is the `strategist` on Opus/medium. Every later PLAN turn is Sonnet
+   unless the re-plan path applies.
+3. Streak 2 → the reviewer writes `FIX_PLAN.md` on Sonnet, and the next CODE pointer names it.
+   No Opus turn happens.
+4. Streak 4, or the coder `blocked` twice on the same issue → a `fixer` turn on Opus. It may
+   edit source; then a Sonnet review that reads `FIX_REPORT.md`.
+5. Ownership checks for the fixer:
+   - a fixer turn changing 11 source files → violation and pause
+   - a fixer writing `PLAN.md` → violation
+   - the coder writing source during a fixer turn → violation
+6. The streak keeps growing after an Opus fix → a human decision, not a second Opus turn.
+7. First stall → Sonnet re-plan; second stall in the same milestone → Opus `strategist`;
+   third → human decision.
+8. A rule fires with the limit reached → a decision with three options, and no Opus turn before
+   the answer.
+9. DeepSeek `suggest_escalation` with no rule satisfied → Sonnet (and the suggestion is
+   journaled).
+10. Model verification fails → `HumanRequired`, and no pointer is typed.
+11. Every Claude `turn.start` and `turn.end` carries `model`, `effort`, `role` and
+    `model_verified`.
+
+### B6. Platform: the human's Mac
+The human runs **macOS 27.2 "Golden Gate" on Apple Silicon**.
+- Relay (Python):
+  - Support **Apple Silicon (arm64)** with Python 3.11+ (python.org or Homebrew arm64).
+  - Calibrate and run the live checks (phases 5–6 of `BUILD_PLAN.md`) **on macOS 27.2**.
+- Recalibrate after OS updates:
+  - Store the macOS version (`sw_vers -productVersion`) in each calibration file.
+  - If the running version differs, `relay start` refuses until `relay calibrate` is re-run.
+    Accessibility, Screen Recording and app layouts can change between OS releases.
+- Check the permissions at every `relay start`, not only at calibration. They can be revoked or
+  require re-approval after updates.
+
+  Required permissions:
+  - Accessibility (for keystrokes and clicks)
+  - Screen Recording (for `screencapture -l`)
+  - Automation of System Events (for window lookup and clicking buttons by label)
+
+  If any is missing, pause with a clear message naming the System Settings pane.
+- Do not assume undocumented behaviour of macOS 27. Anything the code relies on that cannot be
+  confirmed on 27.2 must be listed under "could not verify" in the report back.
 
 ---
 
@@ -181,7 +244,12 @@ A small macOS app that shows what Relay is doing, built from Relay's own records
   changes, and only redraws for meaningful events.
 
 ### C2. Technology
-- Swift 5.9+, SwiftUI, **macOS 14+**, no third-party packages.
+- SwiftUI and the Swift toolchain from the current Xcode release on the human's Mac, which runs
+  **macOS 27.2 on Apple Silicon**. No third-party packages.
+- **Build arm64 only.** Set the deployment target to **macOS 14**, which is enough for
+  `MenuBarExtra` and `@Observable`, and run all testing on macOS 27.2.
+- Use only documented, stable SwiftUI/AppKit APIs. Do not adopt APIs newer than macOS 14 unless
+  they're needed. If one is used, guard it with `if #available` and list it in the README.
 - The source lives at `plugins/deepseek-relay/apps/RelayWatch/` as a Swift Package with an app
   target (or an Xcode project), with a `README.md` covering build and run steps.
 - App form:
@@ -328,7 +396,7 @@ Relay already does.
 | Phase | Deliverable | Gate |
 |---|---|---|
 | A | All P1 fixes, then the P2s, then the P3s | Every `CLAUDE_REVIEW.md` test passes; `pytest` passes on macOS and Linux |
-| B | `model_policy.py`, the new roles and prompts, journal fields, config, status | B5 tests pass; a fake-driver end-to-end run of 2 milestones shows Opus only on the first plan and one forced fixer turn |
+| B | `model_policy.py`, the new roles and prompts, journal fields, config, status | B5 tests pass; a fake-driver end-to-end run of 2 milestones shows Opus only on the first plan and on one forced hardest-bug fixer turn (streak 4); all other Claude turns are Sonnet |
 | C1 | `docs/EVENTS.md` plus the Python emission test plus fixtures from a real fake-driver run | Schema test passes |
 | C2 | Relay Watch reader, model, chain link check and filter (no UI yet) | C9 tests 1–5 pass (`swift test`) |
 | C3 | Menu bar plus window UI | Manual check on a live fake-driver run: every header value matches `relay status --json` at the same moment |
@@ -341,11 +409,15 @@ When reporting back, include:
 - the Activity Monitor energy numbers
 - any finding deferred, with its reason
 
+## Decisions recorded (human, 2026-10-21)
+1. **Who fixes code:** GLM implements fixes, following the reviewer's feedback or a Sonnet-written
+   `FIX_PLAN.md`. Opus edits code only for the hardest bugs (B2 ladder, step 3).
+2. **When to use Opus:** only when really necessary. Sonnet 5.5 (high) is the default for all
+   planning and reviewing. Opus 5.5 (medium) is used only by the B2 rules, with limits of 1 per
+   milestone (not counting the first master plan) and 3 per day. Going over a limit always asks
+   the human.
+3. **Platform:** macOS 27.2 "Golden Gate" on Apple Silicon (arm64). Relay Watch targets macOS 14
+   and is tested on 27.2; Relay is calibrated and verified on 27.2 (B6).
+
 ## Open questions for the human (do not decide these yourself)
-1. Should GLM still implement Opus's fix plan, or may the `fixer` edit source directly for the
-   very hardest bugs? This plan assumes **GLM implements**, which keeps the ownership model
-   unchanged.
-2. Are the Opus limits right? Defaults are **2 per milestone and 6 per day**.
-3. Is macOS 14 acceptable as the minimum for Relay Watch? `MenuBarExtra` needs macOS 13. macOS
-   14 adds the `@Observable` macro, which keeps refreshes limited to the views whose data changed
-   and so saves energy. Lowering the minimum to 13 means using `ObservableObject` instead.
+- None at present. If a new question comes up while building, stop and ask; do not guess.
