@@ -18,7 +18,8 @@ no conversation of its own to drift.
 ## What it does, in one turn
 
 ```
-1. pick the role whose turn it is (planner / coder / reviewer)
+1. pick the role whose turn it is (planner / reviewer / strategist / fixer / coder)
+   and the model, with a deterministic policy (Sonnet by default, Opus by rule)
 2. write an intent record to STATE.json, snapshot file hashes
 3. focus the right app, select/verify the model, type ONE ASCII pointer line
 4. poll for .relay/CLAUDE_DONE.json or .relay/CODER_DONE.json
@@ -35,6 +36,32 @@ RELAY round 12 role=reviewer: read .relay/HANDOFF.md (sha256 9f3a2b1c4d5e),
 Write .relay/REVIEW.md, then .relay/CLAUDE_DONE.json last.
 ```
 
+## Model policy: Sonnet by default, Opus by rule
+
+Long loops burn Claude tokens, so the model is chosen by code, never by an agent. The decision is
+`relay/model_policy.py::choose_turn(state, phase, cfg)` — a pure function of `STATE.json`, the
+phase and `model_policy` in the config. A DeepSeek `suggest_escalation` is journaled and ignored.
+
+| Role | Model | App | Writes | When |
+|---|---|---|---|---|
+| `planner` | Sonnet 5.5 high | Claude | `PLAN.md`, `HANDOFF.md` | normal planning and the first re-plan |
+| `reviewer` | Sonnet 5.5 high | Claude | `REVIEW.md`, `FIX_PLAN.md` | every review, and a fix plan at streak 2 |
+| `strategist` | Opus 5.5 medium | Claude | `PLAN.md`, `HANDOFF.md`, `STRATEGY.md` | the first master plan, or after a Sonnet re-plan failed |
+| `fixer` | Opus 5.5 medium | Claude | source (max 10 files), `FIX_REPORT.md`, `HANDOFF.md` | the same issue survives 4 reviews, or the coder blocks twice |
+| `coder` | GLM 5.3 flash high | Zcode | source, `CODER_REPORT.md` | everything else |
+
+The reviewer lists stable `blocking_issue_ids`; Relay counts consecutive reviews that list the
+same slug. Streak 2 adds `FIX_PLAN.md` for the coder. Streak 4 (or a coder `blocked` twice on one
+issue) runs the Opus fixer, then a normal Sonnet review that reads `FIX_REPORT.md`. If the streak
+still grows after that fix, only a human can approve another Opus fix.
+
+Limits: `max_opus_turns_per_milestone` (default 1; the first master plan does not count) and
+`max_opus_turns_per_day` (default 3). When a rule fires over a limit, Relay asks with three
+options — allow this Opus turn, continue on Sonnet, or pause — and never silently falls back.
+`relay instruct --opus "..."` (or a decision answer containing "Use Opus") arms one Opus turn.
+Every Claude `turn.start`, `turn.end` and `gui.model` event carries `model`, `effort`, `role` and
+`model_verified` (and `effort_verified`); `model.escalated` records the trigger and both counters.
+
 ## What it will not do
 
 - It will not answer a product, UX, scope, cost, data or security question. It pauses, shows a
@@ -50,6 +77,7 @@ Write .relay/REVIEW.md, then .relay/CLAUDE_DONE.json last.
                     one shared project folder
    Claude Code app            Zcode app                 Monitor (separate process)
    planner / reviewer         coder                     read-only on .relay, writes notes/HALT
+   strategist / fixer (Opus by rule)
         ^  |                     ^  |                              ^
         |  |  pointer + files    |  |                              | journal
         |  v                     |  v                              |
@@ -127,8 +155,9 @@ relay why    --project ~/code/myproject evt-20261020-00042
 When Relay needs a person:
 
 ```bash
-relay decide D-003 "B, keep the free tier" --project ~/code/myproject
-# or edit the ANSWER: line in .relay/PENDING_DECISION.md
+# the one-time code is shown in the desktop notification for D-003
+relay decide --project ~/code/myproject D-003 --code "<code>" "B, keep the free tier"
+# or edit the ANSWER line in .relay/PENDING_DECISION.md: <code> <answer>
 ```
 
 Nothing is lost if the process dies. `relay resume` re-enters the pending turn, and if the
@@ -173,7 +202,7 @@ During the run:
 ```bash
 relay status --project "$PROJECT" --json   # phase, round, pending_decision, paused_reason
 relay instruct --project "$PROJECT" "New scope: keep JSON storage; add CSV export."
-relay decide --project "$PROJECT" D-003 "B, keep the free tier"
+relay decide --project "$PROJECT" D-003 --code "<code from desktop>" "B, keep the free tier"
 relay pause  --project "$PROJECT"
 relay resume --project "$PROJECT"
 relay stop   --project "$PROJECT"
@@ -182,6 +211,14 @@ relay stop   --project "$PROJECT"
 `relay instruct` records a real human instruction in `DECISIONS.md` and the journal, so both
 agents read it on their next turn. It does not answer a pending question; use `relay decide`
 for that. For a mid-turn change, `relay pause`, instruct, then `relay resume`.
+
+In a terminal it asks `y/N`; from a headless host it shows a macOS confirmation dialog. The
+dialog blocks only the `instruct` command, not the Relay loop, but it can take focus, so do not
+invoke it during a GUI turn. To make instructions automatic, set
+`security.require_instruction_confirmation: false` in `.relay/config.json` (or
+`RELAY_SECURITY_REQUIRE_INSTRUCTION_CONFIRMATION=false`). That is a security downgrade: any
+agent or process that can run `relay` could then record a "human" instruction. Keep the default
+unless you trust every process in the environment.
 
 Relay sends desktop and ntfy notifications for decisions. The chat itself is woken only when you
 ask it to check, or when you create a scheduled reminder that polls `relay status --json`.
@@ -196,6 +233,9 @@ a new chat and run `relay status`; no resume is needed unless the loop is paused
 | `GOAL.md` | human / `init` | what the project is for |
 | `PLAN.md`, `HANDOFF.md` | planner | milestones and the next unit of work |
 | `REVIEW.md` | reviewer | verdict and requested changes |
+| `FIX_PLAN.md` | reviewer | exact fix steps when an issue repeats |
+| `STRATEGY.md` | strategist | why the approach changed |
+| `FIX_REPORT.md` | fixer | root cause, files, test results |
 | `CODER_REPORT.md` | coder | what changed, tests run, self-audit |
 | `CLAUDE_DONE.json`, `CODER_DONE.json` | agent, **last** | sentinel: round, file, sha256, verdict |
 | `STATE.json`, `BATON.json` | orchestrator | crash-safe state and whose turn it is |
@@ -212,7 +252,7 @@ Sentinel:
 {"round": 12, "role": "reviewer", "status": "done",
  "verdict": "CHANGES_REQUESTED", "file": ".relay/REVIEW.md",
  "sha256": "…", "summary": "one line", "context_estimate_pct": 61,
- "question": null}
+ "blocking_issue_ids": ["auth-token-expiry"], "question": null}
 ```
 
 A sentinel is ignored when its round is stale, its `sha256` does not match, or its mtime
@@ -228,7 +268,8 @@ INIT -> PLAN -> CODE -> REVIEW -> ROUTE
         PROJECT_DONE -> DONE
         STUCK -> PLAN (re-plan)
 any state -> NEEDS_HUMAN -> WAIT_HUMAN -> answer -> resume the same step
-any state -> MONITOR_HALT / CONTEXT_GUARD / budget / round cap -> PAUSED
+any state -> MONITOR_HALT / CONTEXT_GUARD / budget -> PAUSED
+round cap -> decision (raise the cap / re-plan / stop), never a dead-end pause
 ```
 
 Routing is decided deterministically from the reviewer's verdict. DeepSeek reads the round and
@@ -323,9 +364,9 @@ Sources: [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) a
 | `relay start [--detach] [--fake]` | run the loop (auto-starts the monitor) |
 | `relay resume [--clear-halt]` | continue after pause / human answer / crash |
 | `relay pause` / `relay stop` | safe-point pause / stop loop and monitor |
-| `relay status [--json]` | phase, baton, spend, monitor age, pending decision |
-| `relay instruct "text"` | record a new human instruction for both agents |
-| `relay decide ID "answer"` | record a human answer locally |
+| `relay status [--json]` | phase, baton, spend, Opus counters, monitor age, pending decision |
+| `relay instruct "text" [--opus]` | record a new human instruction for both agents; `--opus` also arms one Opus turn |
+| `relay decide ID --code CODE "answer"` | record a human answer locally |
 | `relay trace --round N --verify` | timeline and hash-chain check |
 | `relay why EVENT_ID` | inputs, judgment, response, screenshot, monitor notes |
 | `relay replay CALL_ID` | re-run one DeepSeek judgment with the stored prompt |
@@ -342,8 +383,12 @@ Important knobs:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `claude_app.planner_model` / `_effort` | Opus 5.5 / medium | planner session |
-| `claude_app.reviewer_model` / `_effort` | Sonnet 5.5 / high | reviewer session |
+| `model_policy.default` | Sonnet 5.5 / high | normal model for every Claude role |
+| `model_policy.escalated` | Opus 5.5 / medium | strategist and fixer only |
+| `model_policy.fix_plan_after` | 2 | reviews in a row that trigger `FIX_PLAN.md` |
+| `model_policy.opus_fix_after` | 4 | streak that triggers the Opus fixer |
+| `model_policy.fixer_max_files` | 10 | source files one fixer turn may change |
+| `model_policy.max_opus_turns_per_milestone` / `_per_day` | 1 / 3 | Opus limits (the first plan is exempt from the milestone limit) |
 | `claude_app.max_rounds_per_session` | 4 | rollover trigger |
 | `zcode_app.model` / `_effort` | GLM 5.3 flash / high | coder session |
 | `zcode_app.max_rounds_per_session` | 3 | rollover trigger |
@@ -352,8 +397,8 @@ Important knobs:
 | `deepseek.context_guard` | 0.70 | pause threshold |
 | `deepseek.text_only_mode` | false | never send images |
 | `monitor.interval_minutes` | 10 | periodic check |
-| `max_rounds_per_milestone` | 8 | pause guard |
-| `max_total_rounds` | 60 | pause guard |
+| `max_rounds_per_milestone` | 8 | asks: raise the cap, re-plan, or stop |
+| `max_total_rounds` | 60 | same |
 | `daily_budget_usd` | 20 | pause guard |
 | `security.allow_google_drive` | true | permit projects inside Google Drive (pause sync) |
 | `screenshot_retention_days` | 14 | local retention |
@@ -368,8 +413,27 @@ python3 -m pytest -q
 
 The suite covers crash-safe state, the hash chain (including tamper detection), ownership,
 sentinel staleness, redaction, the context guard, budget, the offline two-milestone loop, a
-decision pause/resume, crash/resume, stale sentinels, rollovers for all three roles, monitor
-fault injection, popup policy, CLI commands and GUI-driver logic with a fake backend.
+decision pause/resume, crash/resume, stale sentinels, rollovers for every role, monitor
+fault injection, popup policy, CLI commands and GUI-driver logic with a fake backend. The Part B
+suite (`tests/test_model_policy.py`) covers the Sonnet default, the first-plan and re-plan Opus
+rules, the fix-plan and fixer ladder, all three fixer ownership limits, the Opus limits and their
+three-option decision, `suggest_escalation` being journaled only, and an unverifiable model typing
+nothing. **167 tests pass** on macOS 27.2 arm64 / Python 3.14.3. Relay Watch adds **20 Swift
+tests** (`swift test` in `apps/RelayWatch`), covering C9 1-5.
+
+## Relay Watch (read-only menu-bar viewer)
+
+`apps/RelayWatch/` is a small SwiftUI app that shows the journal as a live progress view: status
+header with the current model, health lights (heartbeats, journal chain, flags), a round timeline,
+a "Needs you" card with the exact `relay decide` command (never the code), usage today (DeepSeek
+spend, Opus counters, Sonnet-to-Opus ratio), alerts and a raw event inspector. It only reads:
+one `RelayFolder` type with no write APIs, a read-only security-scoped bookmark, no network
+entitlement, and it never answers a decision.
+
+It redraws only for the meaningful events in `docs/EVENTS.md`, using an `FSEventStream` with 3 s
+latency and incremental byte-offset reads — no polling. Build and test instructions, the sandbox
+notes and the energy-check results are in
+[apps/RelayWatch/README.md](apps/RelayWatch/README.md).
 
 ## Limitations
 
@@ -389,8 +453,9 @@ fault injection, popup policy, CLI commands and GUI-driver logic with a fake bac
 - **No built-in global hotkey.** Bind a macOS Shortcut (or any launcher) to `relay pause`; the
   command is the global pause switch.
 - **`host-guard` needs a number.** There is no portable host-usage API; pass `--pct`/`--turns`.
-- **The first turn for an app opens a fresh chat.** Switching planner/reviewer also opens a new
-  chat and re-seeds it from `.relay/`; this is what keeps role memory separate.
+- **The first turn for an app opens a fresh chat.** Switching roles (planner, reviewer,
+  strategist, fixer) also opens a new chat and re-seeds it from `.relay/`; this keeps role memory
+  separate. Opus turns always get a fresh chat.
 - **Monitor Layer 2 needs an API key.** Without one it still runs all deterministic checks.
 - **Cloud-synced folders.** Google Drive is allowed by default for this setup
   (`security.allow_google_drive=true`); keep Drive sync paused while Relay runs. iCloud, Dropbox
@@ -403,3 +468,5 @@ fault injection, popup policy, CLI commands and GUI-driver logic with a fake bac
 - [Design](docs/DESIGN.md) — state machine, turn protocol, invariants.
 - [Security](docs/SECURITY.md) — threat model, data flows, residual risk.
 - [Operations](docs/OPERATIONS.md) — first run, failures, recovery, audit workflow.
+- [Events](docs/EVENTS.md) — every journal event and the `detail` fields Relay Watch relies on.
+- [Relay Watch](apps/RelayWatch/README.md) — build, sandbox, tests and the energy check.

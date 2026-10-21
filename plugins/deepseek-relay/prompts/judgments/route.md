@@ -8,7 +8,8 @@ Return exactly this JSON shape and nothing else:
  "reason": "one sentence",
  "round_summary": "max 3 short lines",
  "drift_flags": ["short strings"],
- "needs_human": null | {"question": "one clear question", "options": [{"label": "A", "consequence": "what happens"}]}}
+ "needs_human": null | {"question": "one clear question", "options": [{"label": "A", "consequence": "what happens"}]},
+ "suggest_escalation": true | false}
 
 Routing rules, applied to the reviewer's verdict when there is one:
 - CHANGES_REQUESTED -> CODE.
@@ -17,6 +18,9 @@ Routing rules, applied to the reviewer's verdict when there is one:
 - NEEDS_HUMAN for any product, UX, scope, cost, data, security, or credential trade-off; for contradictory instructions; or when a human decision is required. Phrase the question and give 2-4 concrete options with consequences. Never invent the answer.
 - STUCK only when the same review feedback repeats with no meaningful code change.
 - Prefer NEEDS_HUMAN over guessing. A wrong automated approval is worse than pausing.
+- `suggest_escalation` is advisory: set it true only when you believe the bug is hard enough
+  for a stronger fixing model. Relay journals it and the model policy decides; you cannot start
+  an escalated turn yourself.
 --- user ---
 Round: $round
 Milestone: $milestone

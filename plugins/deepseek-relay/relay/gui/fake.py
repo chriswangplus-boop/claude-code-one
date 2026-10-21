@@ -23,6 +23,7 @@ def write_sentinel(
     context_pct: int = 40,
     question: str | None = None,
     options: list[dict] | None = None,
+    blocking_issue_ids: list[str] | None = None,
 ) -> Path:
     target = project_dir / file_rel
     if not target.exists():
@@ -39,6 +40,7 @@ def write_sentinel(
         "context_estimate_pct": context_pct,
         "question": question,
         "options": options,
+        "blocking_issue_ids": blocking_issue_ids,
     }
     sentinel = project_dir / ".relay" / ("CODER_DONE.json" if role == "coder" else "CLAUDE_DONE.json")
     sentinel.parent.mkdir(parents=True, exist_ok=True)
@@ -75,6 +77,9 @@ class FakeAppDriver(AppDriver):
         self.focus_failures = 0
         self.new_session_calls = 0
         self.models: list[tuple[str, str]] = []
+        self.model_roles: list[str | None] = []
+        self.model_fails = False
+        self.effort_verified: bool | str = True
         self.verified: list[bool | None] = []
         self.idle_waits = 0
 
@@ -87,8 +92,16 @@ class FakeAppDriver(AppDriver):
     def new_session(self) -> None:
         self.new_session_calls += 1
 
-    def select_model(self, name: str, effort: str) -> None:
+    def select_model(self, name: str, effort: str, role: str | None = None) -> dict:
+        from ..errors import HumanRequired
+
         self.models.append((name, effort))
+        self.model_roles.append(role)
+        if self.model_fails:
+            raise HumanRequired(
+                f"could not verify the model label in {self.name}", reason="model verification failed"
+            )
+        return {"model_verified": True, "effort_verified": self.effort_verified}
 
     def ring(self, pointer_line: str) -> None:
         self.rings.append(pointer_line)
@@ -114,6 +127,9 @@ class FakeAppDriver(AppDriver):
 
     def wait_for_idle(self, seconds: int) -> None:
         self.idle_waits += 1
+
+    def is_user_idle(self, seconds: int) -> bool:
+        return True
 
 
 def pointer_role(pointer: str) -> str | None:

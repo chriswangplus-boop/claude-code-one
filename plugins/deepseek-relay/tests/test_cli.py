@@ -3,7 +3,7 @@ from pathlib import Path
 
 from relay.cli import main
 from relay.context import open_project
-from relay.decisions import write_pending
+from relay.decisions import hash_code, new_code, write_pending
 
 
 def run(*args) -> int:
@@ -55,9 +55,10 @@ def test_decide_answers_locally(tmp_path, capsys):
     state["phase"] = "WAIT_HUMAN"
     state["return_to"] = "REVIEW"
     state["round"] = 2
+    code = new_code()
     state["pending_decision"] = {
         "id": "D-001", "question": "JSON or SQLite?", "return_to": "REVIEW", "round": 2,
-        "options": [],
+        "options": [], "code_hash": hash_code(code),
     }
     ctx.store.save(state)
     write_pending(
@@ -65,13 +66,14 @@ def test_decide_answers_locally(tmp_path, capsys):
         context_lines=["storage choice"], options=[{"label": "JSON", "consequence": "simple"}],
         suggestion=None, round_no=2, reason="needs a decision", clock=ctx.clock,
     )
-    assert run("decide", "--project", project, "D-001", "JSON,", "keep", "it", "simple") == 0
+    assert run("decide", "--project", project, "D-001", "--code", code, "JSON,", "keep", "it", "simple") == 0
     assert "D-001 answered" in capsys.readouterr().out
     assert "JSON, keep it simple" in ctx.paths.decisions.read_text()
     assert ctx.store.load()["phase"] == "REVIEW"
 
-    # wrong id is a clean error
-    assert run("decide", "--project", project, "D-009", "no") == 2
+    # wrong id / wrong code are clean errors
+    assert run("decide", "--project", project, "D-009", "--code", code, "no") == 2
+    assert run("decide", "--project", project, "D-001", "--code", "wrongcode", "no") == 2
 
 
 def test_pause_stop_and_host_guard(tmp_path):
@@ -145,10 +147,11 @@ def test_google_drive_project_runs_without_override(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["phase"] == "DONE"
 
 
-def test_instruct_records_human_instruction(tmp_path, capsys):
+def test_instruct_records_human_instruction(tmp_path, capsys, monkeypatch):
     project = tmp_path / "proj"
     assert run("init", "--project", project, "--no-ntfy") == 0
     capsys.readouterr()
+    monkeypatch.setattr("relay.cli.confirm_human", lambda prompt: True)
     assert run("instruct", "--project", project, "Prefer", "JSON", "and", "keep", "dependencies", "minimal") == 0
     out = capsys.readouterr().out
     assert "D-001 recorded" in out
@@ -161,3 +164,28 @@ def test_instruct_records_human_instruction(tmp_path, capsys):
     assert event["actor"] == "human"
     assert event["detail"]["source"] == "host-instruction"
     assert ctx.store.load()["decisions"] == 1
+
+
+def test_instruct_requires_human_confirmation(tmp_path, monkeypatch, capsys):
+    project = tmp_path / "proj"
+    assert run("init", "--project", project, "--no-ntfy") == 0
+    capsys.readouterr()
+    monkeypatch.setattr("relay.cli.confirm_human", lambda prompt: False)
+    assert run("instruct", "--project", project, "Do", "not", "record") == 2
+    assert not open_project(project).paths.decisions.read_text().count("Host instruction")
+    monkeypatch.setattr("relay.cli.confirm_human", lambda prompt: True)
+    assert run("instruct", "--project", project, "Record", "this") == 0
+    assert "Record this" in open_project(project).paths.decisions.read_text()
+
+
+def test_instruction_confirmation_can_be_disabled_explicitly(tmp_path, capsys):
+    project = tmp_path / "proj"
+    assert run("init", "--project", project, "--no-ntfy") == 0
+    (project / ".relay" / "config.json").write_text(
+        json.dumps({"security": {"require_instruction_confirmation": False}})
+    )
+    capsys.readouterr()
+    assert run("instruct", "--project", project, "Auto", "test", "instruction") == 0
+    out = capsys.readouterr().out
+    assert "confirmation is disabled" in out
+    assert "Auto test instruction" in open_project(project).paths.decisions.read_text()

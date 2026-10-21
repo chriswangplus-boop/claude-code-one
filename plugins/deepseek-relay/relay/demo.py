@@ -32,10 +32,15 @@ class DemoApps:
             self._write(f".relay/CHECKPOINT_{role}.md", f"checkpoint {role} {round_no}\n")
             write_sentinel(self.project, role, round_no, f".relay/CHECKPOINT_{role}.md", context_pct=60)
             return
-        if role == "planner":
+        if role in ("planner", "strategist"):
+            if role == "strategist":
+                self._write(".relay/STRATEGY.md", "# Strategy\n\nKeep the CLI small and test it.\n")
             self._write(".relay/PLAN.md", "# Plan\n\n1. todo CLI with add/list/done\n2. tests\n")
             self._write(".relay/HANDOFF.md", f"Implement milestone for round {round_no}. Run pytest.\n")
-            write_sentinel(self.project, "planner", round_no, ".relay/HANDOFF.md", context_pct=30)
+            write_sentinel(self.project, role, round_no, ".relay/HANDOFF.md", context_pct=30)
+        elif role == "fixer":
+            self._write(".relay/FIX_REPORT.md", f"# Fix report {round_no}\n\nRoot cause fixed, tests pass.\n")
+            write_sentinel(self.project, "fixer", round_no, ".relay/FIX_REPORT.md", context_pct=35)
         elif role == "reviewer":
             verdict = self.verdicts.popleft() if self.verdicts else "PROJECT_DONE"
             self._write(".relay/REVIEW.md", f"Review round {round_no}: {verdict}\n")

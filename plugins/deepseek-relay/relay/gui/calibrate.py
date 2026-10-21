@@ -65,18 +65,23 @@ def calibrate_app(
     permissions = backend.permissions()
     print(f"Accessibility: {'ok' if permissions['accessibility'] else 'NOT GRANTED'}")
     print(f"Screen Recording: {'ok' if permissions['screen_recording'] else 'NOT GRANTED (captures may be black)'}")
-    if not permissions["accessibility"]:
+    if not permissions["accessibility"] or not permissions["system_events"]:
         raise ConfigError(
-            "Grant Accessibility to the app running Relay in System Settings > Privacy & Security > "
-            "Accessibility, then run calibration again."
+            "Grant Accessibility (and Automation of System Events) to the app running Relay in "
+            "System Settings > Privacy & Security, then QUIT and RELAUNCH that app. macOS caches "
+            "these permissions per process; rerunning calibration in the old process is not enough."
         )
     if not permissions["screen_recording"]:
-        print("Tip: grant Screen Recording too, or screenshots will be black and vision checks will fail.")
+        raise ConfigError(
+            "Grant Screen Recording to the app running Relay in System Settings > Privacy & Security > "
+            "Screen Recording, then QUIT and RELAUNCH that app (macOS caches this permission at launch). "
+            "After relaunch, run calibration again."
+        )
 
     defaults = DEFAULTS[app]
     process_name = _ask("Process name (as shown in Activity Monitor)", defaults["process_name"])
     title_contains = _ask("Window title contains", defaults["title"])
-    window = backend.window(process_name, title_contains)
+    window = backend.inspect_window(process_name, title_contains)
     if not window:
         raise ConfigError(f"could not find a window for process {process_name!r}")
     bounds = window["rect"]
@@ -89,7 +94,7 @@ def calibrate_app(
     except OSError:
         pass
     shot = shots / f"{app}-window.png"
-    backend.capture_region(bounds, shot)
+    backend.capture(process_name, title_contains, shot)
     print(f"Screenshot: {shot}")
     try:
         from PIL import Image  # type: ignore
@@ -115,13 +120,17 @@ def calibrate_app(
         use_picker = _ask("Does this app have a model picker you can click? (y/n)", "y").lower().startswith("y")
         if use_picker:
             point = _ask_point("Model picker button")
-            label = _ask_region("Model label region (x,y,w,h)", optional=False)
-            model_picker = {"point": list(point), "label_region": list(label) if label else None, "clear": True}
+            label = None
+            while label is None:
+                label = _ask_region("Model label region (x,y,w,h) - required", optional=False)
+            model_picker = {"point": list(point), "label_region": list(label), "clear": True}
         context_region = _ask_region("Context percentage indicator region")
     else:
         context_region = _ask_region("Context percentage indicator region (blank if none)")
     busy_region = _ask_region("Busy indicator region")
-    input_region = _ask_region("Input box region (to verify the pointer was sent)", optional=False)
+    input_region = None
+    while input_region is None:
+        input_region = _ask_region("Input box region (to verify the pointer was sent) - required", optional=False)
     popup_region = _ask_region("Approval popup region (blank = whole window)")
 
     calibration = Calibration(

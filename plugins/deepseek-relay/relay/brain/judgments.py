@@ -68,6 +68,8 @@ class RouteDecision:
     drift_flags: list[str] = field(default_factory=list)
     call_id: str | None = None
     raw: dict = field(default_factory=dict)
+    # Advisory only: journaled, never a trigger for an Opus turn (Part B2).
+    suggest_escalation: bool = False
 
 
 class Brain:
@@ -146,6 +148,7 @@ class Brain:
             drift_flags=flags,
             call_id=result.call_id,
             raw=data,
+            suggest_escalation=bool(data.get("suggest_escalation")),
         )
 
     def _validate_question(self, value: Any) -> dict:

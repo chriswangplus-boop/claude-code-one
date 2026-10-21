@@ -2,12 +2,24 @@
   "schema": 1,
   "project_dir": ".",
   "claude_app": {
-    "planner_model": "Opus 5.5",
-    "planner_effort": "medium",
-    "reviewer_model": "Sonnet 5.5",
-    "reviewer_effort": "high",
     "max_rounds_per_session": 4,
     "timeout_minutes": 30
+  },
+  "model_policy": {
+    "default": {
+      "model": "Sonnet 5.5",
+      "effort": "high"
+    },
+    "escalated": {
+      "model": "Opus 5.5",
+      "effort": "medium"
+    },
+    "escalate_on_first_plan": true,
+    "fix_plan_after": 2,
+    "opus_fix_after": 4,
+    "fixer_max_files": 10,
+    "max_opus_turns_per_milestone": 1,
+    "max_opus_turns_per_day": 3
   },
   "zcode_app": {
     "model": "GLM 5.3 flash",
@@ -50,13 +62,10 @@
   "max_rejected_sentinels": 3,
   "max_nudges": 1,
   "popup_allow_list": [
-    "read file",
-    "edit file in project",
-    "run tests",
-    "git status",
-    "git diff",
-    "git add",
-    "git commit"
+    "^allow .* to read (?:a )?file(?: .*)?\\??$",
+    "^allow .* to edit (?:a )?file in (?:the )?project(?: .*)?\\??$",
+    "^run (?:the )?tests?(?: .*)?\\??$",
+    "^allow git (status|diff|add|commit)(?: .*)?\\??$"
   ],
   "screenshot_retention_days": 14,
   "ntfy": {
@@ -87,6 +96,11 @@
   "nudge_after_seconds": 180,
   "decision_wait_timeout_minutes": 0,
   "security": {
-    "allow_google_drive": true
-  }
+    "allow_google_drive": true,
+    "require_instruction_confirmation": true
+  },
+  "popup_allow_commands": [
+    "^git (status|diff|add|commit)(?: [^;&|`$<>\\n]*)?$",
+    "^(?:pytest|python3? -m pytest)(?: [^;&|`$<>\\n]*)?$"
+  ]
 }

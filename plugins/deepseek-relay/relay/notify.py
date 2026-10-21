@@ -46,8 +46,15 @@ class Notifier:
         *,
         decision_id: str | None = None,
         urgent: bool = False,
+        desktop_extra: str | None = None,
+        ntfy_body: str | None = None,
     ) -> dict:
         clean_body = truncate(redact(body, self.secrets).text, 300, marker="...")
+        desktop_text = truncate(
+            redact(body + (f"\n{desktop_extra}" if desktop_extra else ""), self.secrets).text,
+            500, marker="..."
+        )
+        ntfy_text = truncate(redact(ntfy_body or body, self.secrets).text, 300, marker="...")
         clean_title = ascii_pointer(redact(title, self.secrets).text)[:120]
         results: dict[str, bool] = {}
         errors: list[str] = []
@@ -55,9 +62,9 @@ class Notifier:
         if bool(self.cfg.get("notify.desktop", True)):
             try:
                 if self.desktop_fn:
-                    results["desktop"] = bool(self.desktop_fn(clean_title, clean_body, urgent))
+                    results["desktop"] = bool(self.desktop_fn(clean_title, desktop_text, urgent))
                 else:
-                    results["desktop"] = self._desktop(clean_title, clean_body, urgent)
+                    results["desktop"] = self._desktop(clean_title, desktop_text, urgent)
             except Exception as exc:  # notifications must never break the loop
                 results["desktop"] = False
                 errors.append(f"desktop: {type(exc).__name__}")
@@ -69,9 +76,9 @@ class Notifier:
                 token = self.cfg.get("ntfy.token") or ntfy_token()
                 try:
                     if self.ntfy_fn:
-                        results["ntfy"] = bool(self.ntfy_fn(server, topic, clean_title, clean_body, token, urgent))
+                        results["ntfy"] = bool(self.ntfy_fn(server, topic, clean_title, ntfy_text, token, urgent))
                     else:
-                        results["ntfy"] = self._ntfy(server, topic, clean_title, clean_body, token, urgent)
+                        results["ntfy"] = self._ntfy(server, topic, clean_title, ntfy_text, token, urgent)
                 except Exception as exc:
                     results["ntfy"] = False
                     errors.append(f"ntfy: {type(exc).__name__}")
@@ -87,6 +94,8 @@ class Notifier:
                 "decision_id": decision_id,
                 "errors": errors,
                 "chars": len(clean_body),
+                "desktop_chars": len(desktop_text),
+                "ntfy_chars": len(ntfy_text),
             },
             result="ok" if any(results.values()) else "failed",
         )
@@ -134,8 +143,11 @@ class FakeNotifier:
         self.sent: list[dict] = []
         self.answer_fn = answer_fn
 
-    def send(self, title, body, *, decision_id=None, urgent=False):
-        self.sent.append({"title": title, "body": body, "decision_id": decision_id, "urgent": urgent})
+    def send(self, title, body, *, decision_id=None, urgent=False, desktop_extra=None, ntfy_body=None):
+        self.sent.append({
+            "title": title, "body": body, "desktop_body": body + (f"\n{desktop_extra}" if desktop_extra else ""),
+            "ntfy_body": ntfy_body or body, "decision_id": decision_id, "urgent": urgent,
+        })
         if self.answer_fn and decision_id:
             self.answer_fn(decision_id)
         return {"channels": {"fake": True}, "errors": []}

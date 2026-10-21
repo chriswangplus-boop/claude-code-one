@@ -62,6 +62,14 @@ class RecoveryFailed(RelayError):
     pass
 
 
+class HumanRequired(RelayError):
+    def __init__(self, question: str, options: list[dict] | None = None, *, reason: str = ""):
+        super().__init__(question)
+        self.question = question
+        self.options = options
+        self.reason = reason or question
+
+
 class PauseRequested(RelayError):
     pass
 

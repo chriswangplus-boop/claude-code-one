@@ -180,16 +180,22 @@ class DeepSeekClient:
         response = self._send_with_retries(url, headers, payload)
         duration_ms = int((time.monotonic() - started) * 1000)
 
+        shape_error: str | None = None
         try:
-            text = response["choices"][0]["message"]["content"]
+            text = str(response["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError) as exc:
-            raise BrainError(f"DeepSeek returned an unexpected response shape: {str(response)[:200]}") from exc
-        try:
-            content = parse_json_lenient(text)
-        except json.JSONDecodeError as exc:
-            raise BrainError(f"DeepSeek did not return valid JSON: {exc}") from exc
-        if not isinstance(content, dict):
-            raise BrainError("DeepSeek JSON response must be an object")
+            text = ""
+            shape_error = f"DeepSeek returned an unexpected response shape: {str(response)[:200]}"
+        content = None
+        parse_error: str | None = None
+        if text:
+            try:
+                content = parse_json_lenient(text)
+            except json.JSONDecodeError as exc:
+                parse_error = f"DeepSeek did not return valid JSON: {exc}"
+            if content is not None and not isinstance(content, dict):
+                content = None
+                parse_error = "DeepSeek JSON response must be an object"
 
         usage = response.get("usage") or {}
         prompt_tokens = int(usage.get("prompt_tokens") or estimated_tokens)
@@ -214,6 +220,7 @@ class DeepSeekClient:
             "messages": _strip_images(messages, image_ref),
             "response_text": text,
             "response": content,
+            "error": shape_error or parse_error,
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
             "ctx_pct": round(ctx_pct, 4),
             "cost_usd": cost,
@@ -227,7 +234,10 @@ class DeepSeekClient:
         self.journal.append(
             "deepseek.call",
             actor=self.actor,
-            detail={"job": ctx.job, "model": self.model, "prompt_version": self._prompt_version()},
+            detail={
+                "job": ctx.job, "model": self.model, "prompt_version": self._prompt_version(),
+                "error": shape_error or parse_error,
+            },
             deepseek={
                 "call_id": call_id,
                 "prompt_ref": ref,
@@ -241,6 +251,9 @@ class DeepSeekClient:
             outputs=[{"path": ref, "sha256": sha256_file(self.journal.paths.calls_dir / f"{call_id}.json")}],
             duration_ms=duration_ms,
         )
+
+        if shape_error or parse_error:
+            raise BrainError(shape_error or parse_error or "DeepSeek judgment failed")
 
         if ctx_pct >= self.guard:
             self.journal.append(

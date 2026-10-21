@@ -44,12 +44,18 @@ def check_invariants(
     journal_ok: bool = True,
     journal_errors: list[str] | None = None,
     heartbeat_age: float | None = None,
+    history_start: int = 0,
 ) -> list[Finding]:
-    """Layer 1: everything here is deterministic and needs no model."""
+    """Layer 1: everything here is deterministic and needs no model.
+
+    History-based checks only look after the latest `human.halt_cleared` event, so a human can
+    review and clear a past halt without it immediately re-firing.
+    """
     findings: list[Finding] = []
     journal_errors = journal_errors or []
     phase = str(state.get("phase") or "INIT")
     active = phase in ACTIVE_PHASES
+    history = events[history_start:]
 
     if not journal_ok:
         findings.append(Finding(
@@ -57,7 +63,7 @@ def check_invariants(
             {"errors": journal_errors[:10]},
         ))
 
-    for event in events:
+    for event in history:
         if event.get("type") == "integrity.violation":
             findings.append(Finding(
                 "ownership", f"integrity violation at {event.get('id')}: {event.get('detail')}", "halt",
@@ -104,6 +110,8 @@ def check_invariants(
     # rollover must have happened when the context signal was high
     threshold = float(cfg.get("rollover_threshold", 0.7)) * 100
     for index, event in enumerate(events):
+        if index < history_start:
+            continue
         if event.get("type") != "turn.end":
             continue
         ctx_pct = (event.get("detail") or {}).get("ctx_pct")
@@ -135,6 +143,8 @@ def check_invariants(
     # context guard and budget
     guard = float(cfg.get("deepseek.context_guard", 0.7))
     for index, event in enumerate(events):
+        if index < history_start:
+            continue
         if event.get("type") == "deepseek.call":
             ctx_pct = float((event.get("deepseek") or {}).get("ctx_pct") or 0)
             if ctx_pct >= guard and phase != "PAUSED":
@@ -178,6 +188,7 @@ def check_invariants(
     # baton must match the open activity
     open_turn_role: str | None = None
     open_rollover = False
+    open_checkpoint = False
     for event in events:
         if event.get("type") == "turn.start":
             open_turn_role = (event.get("detail") or {}).get("role")
@@ -187,19 +198,32 @@ def check_invariants(
             open_rollover = True
         elif event.get("type") == "rollover":
             open_rollover = False
+        elif event.get("type") == "session.checkpoint.start":
+            open_checkpoint = True
+        elif event.get("type") == "session.checkpoint":
+            open_checkpoint = False
     holder = baton.get("holder", "none")
     pending = state.get("pending") or {}
     expected = pending.get("role") if isinstance(pending, dict) else None
     if active:
+        pending_turn_started = any(
+            e.get("type") == "turn.start"
+            and (e.get("detail") or {}).get("role") == expected
+            and int(e.get("round", -1)) == int((pending or {}).get("round", -2))
+            for e in events
+        )
         if expected and holder not in (expected, "human"):
-            findings.append(Finding(
-                "baton", f"baton is {holder!r} but the pending turn belongs to {expected!r}", "halt",
-            ))
+            if holder == "none" and not pending_turn_started:
+                pass  # the orchestrator is between saving pending and setting the baton
+            else:
+                findings.append(Finding(
+                    "baton", f"baton is {holder!r} but the pending turn belongs to {expected!r}", "halt",
+                ))
         elif open_turn_role and holder not in (open_turn_role, "human"):
             findings.append(Finding(
                 "baton", f"baton is {holder!r} but the open turn belongs to {open_turn_role!r}", "halt",
             ))
-        elif not open_turn_role and not open_rollover and holder not in ("none", "human"):
+        elif not open_turn_role and not open_rollover and not open_checkpoint and holder not in ("none", "human"):
             last_type = events[-1].get("type") if events else None
             if last_type != "turn.end":  # a turn just closing is not a stuck baton
                 findings.append(Finding("baton", f"baton is held by {holder!r} with no open turn", "halt"))
@@ -222,7 +246,7 @@ def check_invariants(
 
     # repeated review feedback: three identical review artifacts is a loop
     review_hashes = []
-    for event in events:
+    for event in history:
         if event.get("type") != "turn.end" or (event.get("detail") or {}).get("role") != "reviewer":
             continue
         for output in event.get("outputs") or []:
@@ -289,9 +313,14 @@ class Monitor:
         baton = self.store.baton()
         age = self.store.heartbeat_age(self.paths.heartbeat)
 
+        history_start = 0
+        for index, event in enumerate(events):
+            if event.get("type") == "human.halt_cleared":
+                history_start = index + 1
         findings = check_invariants(
             self.cfg, self.paths, state, baton, events,
             journal_ok=journal_ok, journal_errors=journal_errors, heartbeat_age=age,
+            history_start=history_start,
         )
         if state_error:
             findings.append(Finding("state_unreadable", f"STATE.json cannot be read: {state_error}", "halt"))
@@ -352,7 +381,12 @@ class Monitor:
     # --- actions ----------------------------------------------------------
     def _halt(self, findings: list[Finding], state: dict) -> None:
         reason = "; ".join(finding.message for finding in findings)
-        key = "|".join(sorted(finding.code for finding in findings)) + "|" + reason[:200]
+        key = "|".join(
+            sorted(
+                f"{finding.code}:{finding.detail.get('event') or finding.detail.get('id') or finding.detail.get('round') or ''}"
+                for finding in findings
+            )
+        )
         if key == self._last_halt_key:
             return
         self._last_halt_key = key

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import threading
 
 import pytest
@@ -117,3 +118,21 @@ def test_corrupt_tail_refuses_to_fork_the_chain(ctx, paths):
         fh.write('{"broken":')
     with pytest.raises(JournalError, match="refusing to append"):
         ctx.journal.append("next")
+
+
+def test_journal_repair_quarantines_a_partial_tail(ctx, paths):
+    ctx.journal.append("good.event", detail={"ok": True})
+    files = sorted(paths.journal_dir.glob("*.jsonl"))
+    files[0].write_bytes(files[0].read_bytes() + b'{"partial":')
+    from relay.errors import JournalError
+    with pytest.raises(JournalError):
+        ctx.journal.append("blocked")
+    result = ctx.journal.repair()
+    assert result["repaired"] is True
+    assert result["quarantined"]
+    assert Path(result["quarantined"]).exists()
+    ok, errors = ctx.journal.verify()
+    assert ok, errors
+    ctx.journal.append("after.repair")
+    ok, errors = ctx.journal.verify()
+    assert ok, errors

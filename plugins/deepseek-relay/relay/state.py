@@ -52,6 +52,23 @@ def atomic_write_text(path: str | Path, text: str, mode: int = 0o600) -> None:
             tmp.unlink()
 
 
+def atomic_write_bytes(path: str | Path, data: bytes, mode: int = 0o600) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".relay-tmp-", suffix=path.suffix)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def atomic_write_json(path: str | Path, obj: Any, mode: int = 0o600) -> None:
     atomic_write_text(path, json.dumps(obj, indent=2, sort_keys=True) + "\n", mode=mode)
 
@@ -155,6 +172,7 @@ def new_state(clock: RealClock | None = None) -> dict:
             "rounds_in_milestone": 0,
             "consecutive_changes": 0,
             "replans": 0,
+            "stalls_in_milestone": 0,
             "deepseek_calls": 0,
         },
         "budget": {"date": now[:10], "spent_usd": 0.0},
@@ -175,6 +193,19 @@ def new_state(clock: RealClock | None = None) -> dict:
         "updated_at": now,
         "notification": {"last_sent_at": None, "count": 0},
         "rollover": {"pending": None, "forced": False, "forced_roles": []},
+        "blocked": None,
+        "limit_overrides": {},
+        "last_effect_id": None,
+        # Part B: model policy bookkeeping
+        "opus": {"date": None, "day": 0, "milestone": 1, "milestone_turns": 0},
+        "opus_override": None,
+        "opus_declined": None,
+        "opus_fixed": {},
+        "human_opus_request": None,
+        "human_opus_applied": None,
+        "issue_streaks": {},
+        "blocked_streaks": {},
+        "last_review_issues": [],
     }
 
 

@@ -226,7 +226,30 @@ def test_host_instruction_is_valid_human_evidence(ctx):
     from relay.decisions import record_instruction
 
     monitor, _ = base_monitor(ctx)
-    record_instruction(ctx, "Prefer JSON and keep dependencies minimal")
+    record_instruction(ctx, "Prefer JSON and keep dependencies minimal", confirmed=True)
     result = monitor.check_once()
     assert result["halted"] is False
     assert not ctx.paths.halt_flag.exists()
+
+
+def test_halt_clear_watermark_prevents_immediate_rehalt(ctx):
+    monitor, _ = base_monitor(ctx)
+    ctx.journal.append("integrity.violation", detail={"kind": "ownership"}, result="blocked")
+    assert monitor.check_once()["halted"] is True
+    ctx.store.clear_flag("halt")
+    ctx.journal.append("human.halt_cleared", actor="human", detail={"previous_reason": "ownership"})
+    fresh = Monitor(ctx, notifier=FakeNotifier())
+    assert fresh.check_once()["halted"] is False
+    assert not ctx.paths.halt_flag.exists()
+
+    ctx.journal.append("integrity.violation", detail={"kind": "secret"}, result="blocked")
+    assert fresh.check_once()["halted"] is True
+
+
+def test_turn_starting_between_pending_and_baton_does_not_halt(ctx):
+    monitor, _ = base_monitor(ctx, phase="CODE", role="coder")
+    state = ctx.store.load()
+    state["pending"] = {"phase": "CODE", "role": "coder", "round": 3}
+    ctx.store.save(state)
+    ctx.store.clear_baton()
+    assert monitor.check_once()["halted"] is False

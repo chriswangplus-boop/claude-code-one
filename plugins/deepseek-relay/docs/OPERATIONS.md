@@ -8,7 +8,9 @@
 2. `relay init --project <dir> --goal "<one sentence>" --set-api-key`
 3. Open the project folder in both apps. Leave each app on a normal chat screen.
 4. `relay calibrate --app claude` and `relay calibrate --app zcode`.
-   - Grant Accessibility (required) and Screen Recording (needed for vision).
+   - Grant Accessibility (required), Screen Recording (needed for vision) and Automation of
+     System Events. **Quit and relaunch the app that runs Relay** after granting Screen Recording;
+     macOS caches it per process, so a running harness will still see black captures.
    - Both self-tests must report the same `working_dir`.
 5. Run a short pilot: `relay start --project <dir> --max-steps 6`.
 6. Check `relay status`, `relay trace --verify`, and `git log --oneline`.
@@ -18,8 +20,11 @@
 - `relay status` is safe to run at any time; it only reads.
 - `relay pause` stops at the next safe point. `relay resume` continues. Bind a macOS Shortcut
   to `relay pause` if you want a global hotkey; there is no built-in one.
-- Planner and reviewer are separate chats in the same app. Relay opens a fresh chat and seeds it
-  from files whenever the role changes, so a different chat is normal, not data loss.
+- Planner, reviewer, strategist and fixer are separate chats in the same app. Relay opens a
+  fresh chat and seeds it from files whenever the role changes, so a different chat is normal,
+  not data loss. Opus turns always get a fresh chat, which keeps their context (and cost) small.
+- `relay status` shows `Opus today: x/3, this milestone: y/1`. Read it before wondering why a
+  fix ran on a cheaper model.
 - `relay stop` also stops the monitor. `relay resume` clears the stop flag.
 - Do not edit `.relay/` files while a turn is open. If you do, the ownership check pauses and
   asks; it never overwrites silently.
@@ -45,7 +50,7 @@ access token.
 Answer with:
 
 ```bash
-relay decide D-003 "B, keep the free tier"
+relay decide D-003 --code "<code>" "B, keep the free tier"
 ```
 
 or edit the `ANSWER:` line. The harness appends a `DECISIONS.md` entry with the
@@ -62,6 +67,31 @@ relay instruct "keep JSON; add CSV export" --project ~/code/myproject
 It is appended to `DECISIONS.md` with a `decision.answered` journal event. Both agents read it on
 their next turn. To make it take effect during a turn, pause first and resume afterwards.
 
+`relay instruct` asks for confirmation (TTY `y/N` or a macOS dialog). If you are driving Relay
+unattended and accept the risk, set `security.require_instruction_confirmation=false`; otherwise a
+prompt-injected agent could record its own instruction. The dialog does not pause the loop, but it
+can steal focus, so avoid running it mid-turn.
+
+## Model policy and Opus limits
+
+The model is chosen by code (`relay/model_policy.py`), never by an agent or by DeepSeek. Sonnet 5.5
+at high effort is the default for planning and review. Opus 5.5 at medium effort runs only the
+`strategist` (first master plan, or a second stall after a Sonnet re-plan) and the `fixer` (the
+same issue at streak 4, or the coder blocked twice on it). `relay why EVENT_ID` on a
+`model.escalated` event shows the trigger and both counters.
+
+Limits come from `model_policy`: 1 Opus turn per milestone (the first master plan is exempt) and 3
+per day. When a rule fires over a limit, Relay writes a three-option decision — **Allow this Opus
+turn**, **Continue on Sonnet**, or **Pause** — and waits. Nothing runs before the answer. Choosing
+"Continue on Sonnet" is remembered for that issue until its streak changes.
+
+`relay instruct --opus "..."` arms one Opus turn for the next phase that has an Opus role; a
+decision answer containing "Use Opus" does the same. Both count toward the limits.
+
+If a round cap is reached, Relay also asks: **Raise the cap** (adds at least 3 rounds, stored in
+`STATE.json`), **Re-plan** (starts a new cycle and restarts the milestone round count), or **Stop
+for now**. There is no config edit to make and no unpickable pause.
+
 ## Failure playbook
 
 | Symptom | What to do |
@@ -75,6 +105,8 @@ their next turn. To make it take effect during a turn, pause first and resume af
 | `WAIT_HUMAN: popup` | Approve/deny the dialog yourself, then answer with `relay decide` or resume after closing it. |
 | `WAIT_HUMAN: uncommitted changes` | Commit or stash your edits, then `relay resume`. |
 | App not responding / timeout | The pending turn is kept. Open the app, check the chat, then `relay resume`; it re-sends the same pointer and round. |
+| `WAIT_HUMAN: model label` | Nothing was typed. Re-run `relay calibrate --app claude`; the model picker or its label region has drifted. |
+| `WAIT_HUMAN: Opus limit` | Answer the three-option decision: allow one Opus turn, continue on Sonnet, or pause. Raising the limits is an explicit `model_policy` edit. |
 | Wrong model selected | `relay calibrate --app claude` again; the model label verification is what failed. |
 | Coordinates drifted after an app update | Re-run calibration for that app. |
 | Journal chain broken | Do not continue. Copy `.relay/` for investigation, inspect `relay trace --verify`, and restore from git if needed. |

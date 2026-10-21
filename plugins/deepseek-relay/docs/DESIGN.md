@@ -39,6 +39,17 @@ A sentinel is a claim. Relay validates the claim independently:
 Rejected sentinels are journaled. Identical rejected content is not counted repeatedly; the
 turn times out or is nudged instead of escalating on every poll.
 
+## Model choice
+
+Who runs a turn, and on which model, is a deterministic function of `STATE.json`, the phase and
+`model_policy`: `relay/model_policy.py::choose_turn`. Roles are `planner`, `reviewer`,
+`strategist` and `fixer` in the Claude app, and `coder` in Zcode. Sonnet 5.5 high is the default;
+Opus 5.5 medium is used only for the `strategist` (first master plan, or a second stall after a
+Sonnet re-plan) and the `fixer` (the same issue at review streak 4, or a coder blocked twice on
+it). Limits (1 Opus turn per milestone excluding the first plan, 3 per day) ask the human instead
+of falling back. DeepSeek's `suggest_escalation` is journaled and never a trigger. The ladder,
+ownership rules and tests are described in the README (Part B).
+
 ## Ownership
 
 | Path | Owner |

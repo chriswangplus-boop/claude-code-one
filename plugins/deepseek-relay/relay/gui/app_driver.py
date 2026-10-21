@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from ..errors import AppMismatch, BrainError, PauseRequested, VisionUnavailable
+from ..errors import AppMismatch, BrainError, HumanRequired, PauseRequested, VisionUnavailable
 from ..paths import Paths
 from ..state import atomic_write_json
 from ..util import ascii_pointer, sha256_file
@@ -149,46 +149,105 @@ class GuiAppDriver(AppDriver):
         except (VisionUnavailable, BrainError, ScreenError):
             return None
 
-    def select_model(self, name: str, effort: str) -> None:
+    def select_model(self, name: str, effort: str, role: str | None = None) -> dict:
         picker = self.cal.model_picker
         if not isinstance(picker, dict) or not picker.get("point"):
-            raise AppMismatch(f"{self.name} calibration has no model picker")
+            self.journal.append(
+                "gui.model", detail={"app": self.name, "role": role, "model_verified": False},
+                result="unverified",
+            )
+            raise HumanRequired(
+                f"{self.name} has no calibrated model picker; recalibrate before running.",
+                reason="model picker is not calibrated",
+            )
+        region = _region(picker.get("label_region"))
+        if region is None:
+            self.journal.append(
+                "gui.model", detail={"app": self.name, "role": role, "model_verified": False},
+                result="unverified",
+            )
+            raise HumanRequired(
+                f"{self.name} has no calibrated model-label region; recalibrate before running.",
+                reason="model label is not calibrated",
+            )
+        if self.vision is None:
+            self.journal.append(
+                "gui.model",
+                detail={"app": self.name, "role": role, "model_verified": "unverifiable"},
+                result="unverified",
+            )
+            raise HumanRequired(
+                f"Relay cannot verify the model label in {self.name} (vision unavailable).",
+                reason="model label cannot be verified",
+            )
         for attempt in range(2):
             self.focus()
             target = self._abs(picker["point"])
+            before = self._capture(region, "model-before")
+            before_hash = sha256_file(before.path)
             self.backend.click(target.x, target.y)
             self.journal.append("gui.click", detail={"app": self.name, "target": "model-picker"})
             self.sleep(0.5)
+            after = self._capture(region, "model-after")
+            if sha256_file(after.path) == before_hash:
+                # The picker almost certainly did not open; never type into the chat on a guess.
+                self.journal.append(
+                    "gui.model",
+                    detail={"app": self.name, "role": role, "expected": [name, effort],
+                            "model_verified": False},
+                    result="unverified",
+                )
+                raise HumanRequired(
+                    f"The model picker in {self.name} did not visibly open. Check calibration, then resume.",
+                    reason="model picker did not open",
+                )
             if picker.get("clear", True):
                 self.backend.press("a", ["cmd"])
             self.backend.type_ascii(name)
             self.sleep(0.4)
             self.backend.press("return")
             self.sleep(0.8)
-            region = _region(picker.get("label_region"))
-            if region is None:
-                self.journal.append(
-                    "gui.model", detail={"app": self.name, "model": name, "effort": effort, "verified": None},
-                    result="unverified",
-                )
-                return
             capture = self._capture(region, "model")
             try:
                 seen = self._vision(capture.path, "model_label", f"Expected model {name!r} at effort {effort!r}.")
             except VisionUnavailable:
-                return
+                self.journal.append(
+                    "gui.model",
+                    detail={"app": self.name, "role": role, "model_verified": "unverifiable"},
+                    result="unverified",
+                )
+                raise HumanRequired(
+                    f"Relay cannot verify the model label in {self.name} (vision unavailable).",
+                    reason="model label cannot be verified",
+                )
             got_model = str(seen.get("model") or "").lower()
             got_effort = str(seen.get("effort") or "").lower()
-            if name.lower() in got_model and (not got_effort or got_effort == effort.lower()):
+            confidence = float(seen.get("confidence", 0.5))
+            if confidence >= 0.5 and name.lower() in got_model and (not got_effort or got_effort == effort.lower()):
+                effort_verified: bool | str = True if got_effort else "unverifiable"
                 self.journal.append(
-                    "gui.model", detail={"app": self.name, "model": name, "effort": effort, "seen": seen},
+                    "gui.model",
+                    detail={
+                        "app": self.name, "role": role, "model": name, "effort": effort,
+                        "seen": seen, "model_verified": True, "effort_verified": effort_verified,
+                    },
                 )
-                return
+                return {"model_verified": True, "effort_verified": effort_verified}
             self.journal.append(
-                "gui.model", detail={"app": self.name, "expected": [name, effort], "seen": seen},
+                "gui.model",
+                detail={"app": self.name, "role": role, "expected": [name, effort], "seen": seen,
+                        "model_verified": False},
                 result="mismatch",
             )
-        raise AppMismatch(f"could not verify the model label in {self.name} (expected {name}/{effort})")
+        self.journal.append(
+            "gui.model",
+            detail={"app": self.name, "role": role, "expected": [name, effort], "model_verified": False},
+            result="mismatch",
+        )
+        raise HumanRequired(
+            f"Could not verify the model label in {self.name} (expected {name}/{effort}).",
+            reason="model verification failed",
+        )
 
     # --- ring -------------------------------------------------------------
     def ring(self, pointer_line: str) -> None:
@@ -262,22 +321,21 @@ class GuiAppDriver(AppDriver):
             return None
         if float(result.get("confidence", 1.0)) < 0.6:
             return Popup(text=str(result.get("text") or ""), buttons=[])
-        points: dict[str, tuple[float, float]] = {}
-        for label, point in (result.get("button_points") or {}).items():
-            try:
-                points[str(label)] = self._to_screen(capture, float(point[0]), float(point[1]))
-            except (TypeError, ValueError, IndexError):
-                continue
-        return Popup(text=str(result.get("text") or ""), buttons=list(result.get("buttons") or []), button_points=points)
+        # Deliberately ignore any button_points from the model: clicks go by Accessibility label.
+        return Popup(text=str(result.get("text") or ""), buttons=list(result.get("buttons") or []))
 
     def click_popup(self, popup: Popup, button: str) -> None:
-        point = popup.button_points.get(button)
-        if point is None:
-            raise AppMismatch(f"no calibrated click point for popup button {button!r}")
         if self.backend.idle_seconds() < int(self.cfg.get("user_idle_seconds", 30)):
             raise PauseRequested("user became active before the popup click")
-        self.backend.click(point[0], point[1])
+        if not self.backend.click_button(self.cal.process_name, self.cal.window_title_contains, button):
+            raise AppMismatch(f"popup button {button!r} was not found by Accessibility")
         self.journal.append("gui.click", detail={"app": self.name, "target": f"popup:{button}"})
+
+    def is_user_idle(self, seconds: int) -> bool:
+        try:
+            return self.backend.idle_seconds() >= seconds
+        except Exception:
+            return False
 
     def wait_for_idle(self, seconds: int) -> None:
         deadline = time.time() + 180
@@ -295,10 +353,6 @@ class GuiAppDriver(AppDriver):
             raise AppMismatch(f"{self.name} window disappeared")
         bounds: Rect = window["rect"]
         return Rect(bounds.x + float(point[0]), bounds.y + float(point[1]), 0, 0)
-
-    def _to_screen(self, capture: Capture, px: float, py: float) -> tuple[float, float]:
-        scale = capture.scale or 1.0
-        return capture.region.x + px / scale, capture.region.y + py / scale
 
     def _capture(self, region: tuple[float, float, float, float] | None, tag: str) -> Capture:
         now = datetime.now().astimezone()

@@ -25,8 +25,12 @@ class AppDriver(ABC):
         """Start a fresh chat and verify it is empty."""
 
     @abstractmethod
-    def select_model(self, name: str, effort: str) -> None:
-        """Select model/effort and verify the visible label."""
+    def select_model(self, name: str, effort: str, role: str | None = None) -> dict:
+        """Select model/effort and verify the visible label.
+
+        Returns `{"model_verified": True, "effort_verified": True | "unverifiable"}`.
+        Raises HumanRequired when the label cannot be verified; nothing may be typed then.
+        """
 
     @abstractmethod
     def ring(self, pointer_line: str) -> None:
@@ -54,3 +58,7 @@ class AppDriver(ABC):
     def wait_for_idle(self, seconds: int) -> None:
         """Block until the human has been idle long enough."""
         return None
+
+    def is_user_idle(self, seconds: int) -> bool:
+        """True when it is safe to observe the screen without disturbing the user."""
+        return True

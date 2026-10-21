@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -162,6 +163,30 @@ def validate_config(cfg: Config) -> None:
             raise ConfigError(f"{key} must be positive")
     if not cfg.get("popup_allow_list"):
         raise ConfigError("popup_allow_list must not be empty")
+    for key in ("popup_allow_list", "popup_allow_commands"):
+        for pattern in cfg.get(key, []) or []:
+            try:
+                re.compile(str(pattern))
+            except re.error as exc:
+                raise ConfigError(f"bad regex in {key}: {pattern!r}: {exc}") from exc
+    from .model_policy import policy as model_policy
+
+    mp = model_policy(cfg)
+    for slot in ("default", "escalated"):
+        for field in ("model", "effort"):
+            if not str((mp.get(slot) or {}).get(field) or "").strip():
+                raise ConfigError(f"model_policy.{slot}.{field} must not be empty")
+    fix_plan_after = int(mp["fix_plan_after"])
+    opus_fix_after = int(mp["opus_fix_after"])
+    if fix_plan_after < 1:
+        raise ConfigError("model_policy.fix_plan_after must be at least 1")
+    if opus_fix_after <= fix_plan_after:
+        raise ConfigError("model_policy.opus_fix_after must be greater than fix_plan_after")
+    if int(mp["fixer_max_files"]) < 1:
+        raise ConfigError("model_policy.fixer_max_files must be at least 1")
+    for key in ("max_opus_turns_per_milestone", "max_opus_turns_per_day"):
+        if int(mp[key]) < 0:
+            raise ConfigError(f"model_policy.{key} must not be negative")
     if bool(cfg.get("ntfy.phone_reply", False)):
         raise ConfigError(
             "phone replies are not implemented. Answers are accepted only locally "

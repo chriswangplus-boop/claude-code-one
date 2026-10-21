@@ -17,7 +17,7 @@ from typing import Any, Iterator
 from .clock import RealClock
 from .errors import JournalError
 from .paths import Paths
-from .state import FileLock, atomic_write_json, atomic_write_text
+from .state import FileLock, atomic_write_bytes, atomic_write_json, atomic_write_text
 from .util import canonical_json, sha256_text
 
 DAY_FILE = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
@@ -226,6 +226,69 @@ class Journal:
         with self.lock:
             atomic_write_text(path, text, mode=0o600)
         return path
+
+    # --- repair -----------------------------------------------------------
+    def repair(self) -> dict:
+        """Quarantine a partial/corrupt tail and append a `journal.repaired` event."""
+        files = self._files()
+        if not files:
+            return {"repaired": False, "reason": "no journal files"}
+        path = files[-1]
+        data = path.read_bytes()
+        if not data:
+            return {"repaired": False, "reason": "empty journal"}
+        lines = data.splitlines(keepends=True)
+        offsets = []
+        offset = 0
+        for line in lines:
+            offsets.append(offset)
+            offset += len(line)
+        valid_end = 0
+        invalid_start: int | None = None
+        invalid_index: int | None = None
+        for index, raw in enumerate(lines):
+            stripped = raw.rstrip(b"\r\n")
+            if not stripped:
+                valid_end = offsets[index] + len(raw)
+                continue
+            try:
+                json.loads(stripped.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                invalid_start = offsets[index]
+                invalid_index = index
+                break
+            valid_end = offsets[index] + len(raw)
+        if invalid_start is None:
+            if data and not data.endswith(b"\n"):
+                with self.lock:
+                    with open(path, "ab") as fh:
+                        fh.write(b"\n")
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                event = self.append(
+                    "journal.repaired", actor="harness",
+                    detail={"file": path.name, "quarantined": None, "note": "added missing newline"},
+                )
+                return {"repaired": True, "event": event["id"], "quarantined": None}
+            return {"repaired": False, "reason": "tail is valid"}
+        if invalid_index is not None and any(
+            raw.strip() for raw in lines[invalid_index + 1:]
+        ):
+            raise JournalError("journal corruption is not at the tail; refusing automatic repair")
+        tail = data[invalid_start:]
+        quarantine = self.paths.journal_dir / f"quarantine-{int(self.clock.epoch())}.txt"
+        atomic_write_bytes(quarantine, tail)
+        atomic_write_bytes(path, data[:valid_end])
+        event = self.append(
+            "journal.repaired", actor="harness",
+            detail={
+                "file": path.name,
+                "quarantined": quarantine.name,
+                "bytes": len(tail),
+            },
+            outputs=[{"path": str(quarantine.relative_to(self.paths.project_dir)), "sha256": sha256_text(tail.decode("utf-8", "replace"))}],
+        )
+        return {"repaired": True, "event": event["id"], "quarantined": str(quarantine)}
 
     # --- integrity --------------------------------------------------------
     def verify(self) -> tuple[bool, list[str]]:

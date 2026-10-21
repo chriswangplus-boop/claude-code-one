@@ -32,8 +32,12 @@ def write(root: Path, rel: str, text: str) -> Path:
 
 def test_owner_of():
     assert owner_of("src/app.py") == "coder"
-    assert owner_of(".relay/HANDOFF.md") == "claude"
-    assert owner_of(".relay/REVIEW.md") == "claude"
+    assert owner_of("src/app.py", "fixer") == "fixer"
+    assert owner_of(".relay/HANDOFF.md") == "fixer/planner/strategist"
+    assert owner_of(".relay/REVIEW.md") == "reviewer"
+    assert owner_of(".relay/FIX_PLAN.md") == "reviewer"
+    assert owner_of(".relay/FIX_REPORT.md") == "fixer"
+    assert owner_of(".relay/STRATEGY.md") == "strategist"
     assert owner_of(".relay/CODER_REPORT.md") == "coder"
     assert owner_of(".relay/STATE.json") == "harness"
     assert owner_of(".relay/MONITOR_NOTES.md") == "monitor"
@@ -48,8 +52,11 @@ def test_ownership_is_enforced(tmp_path):
     after = snapshot(tmp_path)
     assert changed_paths(before, after) == [".relay/HANDOFF.md"]
     violations = ownership_violations(before, after, actor="coder")
-    assert violations == [{"path": ".relay/HANDOFF.md", "writer": "coder", "owner": "claude"}]
+    assert violations == [
+        {"path": ".relay/HANDOFF.md", "writer": "coder", "owner": "fixer/planner/strategist"}
+    ]
     assert ownership_violations(before, after, actor="claude") == []
+    assert ownership_violations(before, after, actor="planner") == []
 
 
 def test_coder_may_write_source_and_report(tmp_path):
@@ -200,3 +207,73 @@ def test_git_commit_refuses_staged_secret(tmp_path):
         git_commit(tmp_path, "should not happen")
     log = subprocess.run(["git", "-C", str(tmp_path), "log", "--oneline"], capture_output=True, text=True)
     assert log.returncode != 0 or not log.stdout.strip()
+
+
+def test_control_file_writes_are_ownership_violations(tmp_path):
+    write(tmp_path, ".relay/STATE.json", "{}")
+    write(tmp_path, ".relay/BATON.json", "{}")
+    write(tmp_path, ".relay/MONITOR_NOTES.md", "notes\n")
+    write(tmp_path, ".relay/monitor/CORRECTION.json", "{}")
+    write(tmp_path, ".relay/answers/D-001.txt", "answer\n")
+    write(tmp_path, ".relay/calibration/claude.json", "{}")
+    before = snapshot(tmp_path)
+    write(tmp_path, ".relay/STATE.json", '{"phase":"DONE"}')
+    write(tmp_path, ".relay/BATON.json", '{"holder":"coder"}')
+    write(tmp_path, ".relay/MONITOR_NOTES.md", "agent notes\n")
+    write(tmp_path, ".relay/monitor/CORRECTION.json", '{"action":"replan"}')
+    write(tmp_path, ".relay/answers/D-001.txt", "forged\n")
+    write(tmp_path, ".relay/calibration/claude.json", '{"input_point":[0,0]}')
+    after = snapshot(tmp_path)
+    violations = ownership_violations(before, after, actor="coder")
+    paths = {item["path"] for item in violations}
+    assert paths == {
+        ".relay/STATE.json", ".relay/BATON.json", ".relay/MONITOR_NOTES.md",
+        ".relay/monitor/CORRECTION.json", ".relay/answers/D-001.txt",
+        ".relay/calibration/claude.json",
+    }
+
+
+def test_monitor_and_human_control_changes_need_matching_events(tmp_path):
+    write(tmp_path, ".relay/MONITOR_NOTES.md", "old\n")
+    write(tmp_path, ".relay/PAUSE", "{}")
+    before = snapshot(tmp_path)
+    write(tmp_path, ".relay/MONITOR_NOTES.md", "new\n")
+    write(tmp_path, ".relay/PAUSE", '{"reason":"user"}')
+    after = snapshot(tmp_path)
+    events = [
+        {"id": "evt-1", "type": "monitor.note", "actor": "monitor"},
+        {"id": "evt-2", "type": "human.pause", "actor": "human"},
+    ]
+    assert ownership_violations(before, after, actor="coder", events=events) == []
+
+
+def test_secret_scan_placeholder_filter_is_anchored(tmp_path):
+    write(tmp_path, "leak.py", 'API_KEY = "sk-none-realistic-secret-value"\n')
+    hits = secret_scan(tmp_path)
+    assert any(hit["path"] == "leak.py" for hit in hits)
+
+
+def test_blocking_issue_ids_are_validated(tmp_path):
+    write(tmp_path, ".relay/REVIEW.md", "review")
+    sentinel = sentinel_for(
+        tmp_path, "reviewer", 3, ".relay/REVIEW.md",
+        verdict="CHANGES_REQUESTED", blocking_issue_ids=["auth-token-expiry", "db-lock"],
+    )
+    assert validate_sentinel(
+        sentinel, root=tmp_path, expected_round=3, expected_role="reviewer",
+        expected_file=".relay/REVIEW.md", round_started_wall=time.time() - 1,
+    ) == []
+
+    sentinel["blocking_issue_ids"] = ["Not A Slug"]
+    issues = validate_sentinel(
+        sentinel, root=tmp_path, expected_round=3, expected_role="reviewer",
+        expected_file=".relay/REVIEW.md", round_started_wall=time.time() - 1,
+    )
+    assert any("invalid slug" in issue for issue in issues)
+
+    sentinel["blocking_issue_ids"] = [f"issue-{index}" for index in range(11)]
+    issues = validate_sentinel(
+        sentinel, root=tmp_path, expected_round=3, expected_role="reviewer",
+        expected_file=".relay/REVIEW.md", round_started_wall=time.time() - 1,
+    )
+    assert any("more than 10" in issue for issue in issues)

@@ -19,18 +19,27 @@ HARNESS_OWNED = {
     "config.json", "GOAL.md", "PAUSE", "STOP", "HALT", ".lock", ".run.pid",
     "RULES_CLAUDE.md", "RULES_CODER.md",
 }
-CLAUDE_OWNED = {"PLAN.md", "HANDOFF.md", "REVIEW.md", "CLAUDE_DONE.json", "CHECKPOINT_planner.md", "CHECKPOINT_reviewer.md"}
+# Which role may write which agent file. Source files belong to the role that holds the
+# baton: the coder normally, the fixer only during a fixer turn (Part B).
+ROLE_FILES: dict[str, set[str]] = {
+    "planner": {"PLAN.md", "HANDOFF.md", "CHECKPOINT_planner.md", "CLAUDE_DONE.json"},
+    "reviewer": {"REVIEW.md", "FIX_PLAN.md", "CHECKPOINT_reviewer.md", "CLAUDE_DONE.json"},
+    "strategist": {
+        "PLAN.md", "HANDOFF.md", "STRATEGY.md", "CHECKPOINT_strategist.md", "CLAUDE_DONE.json",
+    },
+    "fixer": {"FIX_REPORT.md", "HANDOFF.md", "CHECKPOINT_fixer.md", "CLAUDE_DONE.json"},
+    "coder": {"CODER_REPORT.md", "CODER_DONE.json", "CHECKPOINT_coder.md"},
+}
+CLAUDE_OWNED = {"PLAN.md", "HANDOFF.md", "REVIEW.md", "FIX_PLAN.md", "STRATEGY.md", "FIX_REPORT.md",
+                "CLAUDE_DONE.json", "CHECKPOINT_planner.md", "CHECKPOINT_reviewer.md",
+                "CHECKPOINT_strategist.md", "CHECKPOINT_fixer.md"}
 CODER_OWNED = {"CODER_REPORT.md", "CODER_DONE.json", "CHECKPOINT_coder.md"}
 
 IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", ".tox", "dist", "build", ".DS_Store"}
-IGNORED_PREFIXES = (
-    ".relay/journal/", ".relay/monitor/", ".relay/answers/", ".relay/calibration/",
-    ".relay/CALIBRATION_",
-)
+IGNORED_PREFIXES = (".relay/journal/",)
 IGNORED_FILES = {
-    ".relay/.lock", ".relay/.run.pid", ".relay/.run.lock", ".relay/STATE.json",
-    ".relay/BATON.json", ".relay/HEARTBEAT.json", ".relay/relay.log",
-    ".relay/PAUSE", ".relay/STOP", ".relay/HALT",
+    ".relay/.lock", ".relay/.run.pid", ".relay/.run.lock", ".relay/HEARTBEAT.json",
+    ".relay/relay.log", ".relay/monitor/HEARTBEAT.json", ".relay/monitor/.monitor.lock",
 }
 IGNORED_SUFFIXES = (".tmp", ".swp", ".pyc", ".log")
 
@@ -39,17 +48,20 @@ def relpath(path: str | Path, root: str | Path) -> str:
     return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
 
 
-def owner_of(rel: str) -> str:
-    """Who may write this path: coder | claude | harness | monitor."""
+def owner_of(rel: str, active_role: str | None = None) -> str:
+    """Who may write this path.
+
+    Source files belong to the baton role (`coder`, or `fixer` during a fixer turn).
+    Agent files list every role allowed to write them, e.g. `planner/strategist`.
+    """
     if not rel.startswith(".relay/"):
-        return "coder"
+        return active_role if active_role in ("coder", "fixer") else "coder"
     name = rel[len(".relay/"):]
     if name in HARNESS_OWNED or name.startswith("journal/") or name.startswith("answers/"):
         return "harness"
-    if name in CLAUDE_OWNED:
-        return "claude"
-    if name in CODER_OWNED:
-        return "coder"
+    roles = sorted(role for role, names in ROLE_FILES.items() if name in names)
+    if roles:
+        return "/".join(roles)
     if name == "MONITOR_NOTES.md" or name.startswith("monitor/"):
         return "monitor"
     return "harness"
@@ -97,18 +109,85 @@ def changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
     return sorted(key for key in keys if before.get(key) != after.get(key))
 
 
+CONTROL_EVENTS = {
+    ".relay/PAUSE": {"human.pause"},
+    ".relay/STOP": {"human.stop"},
+    ".relay/HALT": {"monitor.halt"},
+    ".relay/DECISIONS.md": {"decision.answered", "decision.asked"},
+    ".relay/PENDING_DECISION.md": {"decision.asked", "decision.answered"},
+    ".relay/MONITOR_NOTES.md": {"monitor.note"},
+    ".relay/monitor/CORRECTION.json": {"monitor.correct"},
+    ".relay/monitor/layer2.json": {"monitor.layer2"},
+}
+STATE_EVENTS = {"decision.answered", "decision.asked", "human.halt_cleared"}
+
+
+def _events_after(events: Iterable[dict], turn_start_id: str | None) -> list[dict]:
+    if not events:
+        return []
+    ordered = list(events)
+    if turn_start_id is None:
+        return ordered
+    for index, event in enumerate(ordered):
+        if event.get("id") == turn_start_id:
+            return ordered[index + 1:]
+    return ordered
+
+
+def _control_allowed(rel: str, events: list[dict]) -> bool:
+    allowed = CONTROL_EVENTS.get(rel)
+    if allowed is None:
+        if rel in (".relay/STATE.json", ".relay/BATON.json"):
+            allowed = STATE_EVENTS
+        elif rel.startswith(".relay/answers/"):
+            allowed = {"decision.answered"}
+        else:
+            return False
+    for event in events:
+        if event.get("type") in allowed and event.get("actor") in ("human", "monitor"):
+            return True
+    return False
+
+
+def _actor_may_write(actor: str, owner: str) -> bool:
+    """`owner` is a role, a `role/role` set, or a legacy broad label."""
+    if "/" in owner:
+        allowed = owner.split("/")
+        if actor == "claude":  # legacy alias used by older callers/tests
+            return all(role != "coder" for role in allowed)
+        return actor in allowed
+    if actor == "claude":
+        return owner not in ("coder", "monitor", "harness")
+    return actor == owner
+
+
 def ownership_violations(
-    before: dict[str, str], after: dict[str, str], actor: str
+    before: dict[str, str],
+    after: dict[str, str],
+    actor: str,
+    *,
+    events: Iterable[dict] | None = None,
+    turn_start_id: str | None = None,
+    active_role: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Which changed files were written by someone other than `actor`."""
+    """Which changed files were written by someone other than `actor`.
+
+    Agent files follow the role table. Source files belong to `active_role` (the baton
+    holder: coder or fixer). Control files need proof from a journal event written by the
+    harness/monitor/human during this turn; otherwise they are a violation.
+    """
     if actor == "human":
         return []
+    history = _events_after(events or [], turn_start_id)
     violations = []
     for rel in changed_paths(before, after):
-        owner = owner_of(rel)
-        if owner == "monitor":
-            continue  # the independent monitor may write notes at any time
-        if owner != actor:
+        owner = owner_of(rel, active_role)
+        if owner in ("monitor", "harness"):
+            if _control_allowed(rel, history):
+                continue
+            violations.append({"path": rel, "writer": actor, "owner": owner, "reason": "control file changed without a matching event"})
+            continue
+        if not _actor_may_write(actor, owner):
             violations.append({"path": rel, "writer": actor, "owner": owner})
     return violations
 
@@ -116,6 +195,7 @@ def ownership_violations(
 # --- sentinels ------------------------------------------------------------
 
 ALLOWED_STATUS = {"done", "blocked", "needs_decision"}
+ISSUE_ID = re.compile(r"^[a-z0-9-]{3,40}$")
 ALLOWED_VERDICTS = {"APPROVED", "CHANGES_REQUESTED", "MILESTONE_DONE", "PROJECT_DONE"}
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -185,6 +265,17 @@ def validate_sentinel(
 
     if status == "needs_decision" and not str(sentinel.get("question") or "").strip():
         issues.append("needs_decision without a question")
+
+    issue_ids = sentinel.get("blocking_issue_ids")
+    if issue_ids is not None:
+        if not isinstance(issue_ids, list):
+            issues.append("blocking_issue_ids must be a list")
+        elif len(issue_ids) > 10:
+            issues.append("blocking_issue_ids has more than 10 entries")
+        else:
+            for item in issue_ids:
+                if not isinstance(item, str) or not ISSUE_ID.match(item):
+                    issues.append(f"blocking_issue_ids has an invalid slug: {item!r}")
 
     announced = str(sentinel.get("file") or "")
     if not announced:
@@ -320,7 +411,8 @@ SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 _PLACEHOLDER = re.compile(
-    r"(?i)(?:your[_-]?|example|placeholder|changeme|redacted|\[secret\]|<[^>]*>|\$\{|\$\(|os\.environ|none|null|true|false)"
+    r"(?i)^(?:your(?:[_-]\w+)?|example|placeholder|changeme|redacted|\[secret\]|<[^>]*>|"
+    r"\$\{[^}]*\}|\$\([^)]*\)|os\.environ.*|none|null|true|false)$"
 )
 TEXT_SUFFIXES = {".py", ".md", ".json", ".txt", ".toml", ".yaml", ".yml", ".sh", ".bash", ".zsh", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".sql", ".rb", ".go", ".rs", ".java", ".c", ".h", ".cpp", ".env", ".ini", ".cfg", ".conf"}
 MAX_SCAN_BYTES = 2 * 1024 * 1024
@@ -340,7 +432,7 @@ def _scan_text(text: str) -> list[tuple[str, int]]:
     hits: list[tuple[str, int]] = []
     for rule, pattern in SECRET_RULES:
         for match in pattern.finditer(text):
-            candidate = match.group(match.lastindex or 0)
+            candidate = match.group(match.lastindex or 0).strip("\"'")
             if _PLACEHOLDER.search(candidate):
                 continue
             if rule in {"api_key", "assigned_secret", "env_secret"} and len(candidate) < 8:

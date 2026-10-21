@@ -42,6 +42,15 @@ class Rect:
 
 
 @dataclass
+class WindowInfo:
+    id: int
+    owner: str
+    title: str | None
+    rect: Rect
+    layer: int
+
+
+@dataclass
 class Capture:
     path: Path
     window: Rect
@@ -77,6 +86,7 @@ class MacOSBackend:
             "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
         )
         self._cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        self._cg = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
         self._setup_signatures()
 
     def _run(self, args: list[str], timeout: float = 20.0) -> subprocess.CompletedProcess:
@@ -87,9 +97,12 @@ class MacOSBackend:
 
     # --- permissions ------------------------------------------------------
     def permissions(self) -> dict[str, Any]:
+        accessibility = self._accessibility_ok()
         return {
-            "accessibility": self._accessibility_ok(),
+            "accessibility": accessibility,
             "screen_recording": self._screen_recording_ok(),
+            # System Events automation uses the same TCC gate as Accessibility in practice.
+            "system_events": accessibility,
         }
 
     def _accessibility_ok(self) -> bool:
@@ -105,9 +118,10 @@ class MacOSBackend:
 
     def _screen_recording_ok(self) -> bool:
         probe = Path("/tmp") / f"relay-screen-probe-{int(time.time())}.png"
-        size = self.screen_size() or (800.0, 600.0)
         try:
-            self.capture_region(Rect(size[0] / 2 - 32, size[1] / 2 - 32, 64, 64), probe)
+            self._run([SCREENCAPTURE, "-x", str(probe)], timeout=15)
+            if not probe.exists() or probe.stat().st_size == 0:
+                return False
             try:
                 from PIL import Image  # type: ignore
 
@@ -167,22 +181,97 @@ end tell'''
         return self.window(process_name, title_contains)
 
     # --- screenshots ------------------------------------------------------
-    def capture_region(self, rect: Rect, dest: Path) -> Path:
+    def _cfstring(self, text: str) -> int:
+        return int(self._cf.CFStringCreateWithCString(None, text.encode("utf-8"), 0x08000100))
+
+    def _cg_windows(self) -> list[WindowInfo]:
+        arr = self._cg.CGWindowListCopyWindowInfo(1, 0)
+        if not arr:
+            return []
+        keys = {
+            name: self._cfstring(name)
+            for name in ("kCGWindowNumber", "kCGWindowOwnerName", "kCGWindowName", "kCGWindowLayer", "kCGWindowBounds")
+        }
+        bkeys = {name: self._cfstring(name) for name in ("X", "Y", "Width", "Height")}
+        windows: list[WindowInfo] = []
+
+        def value(dct, key):
+            return self._cf.CFDictionaryGetValue(dct, key) if dct else None
+
+        def text_of(dct, key):
+            ref = value(dct, key)
+            if not ref or self._cf.CFGetTypeID(ref) != self._cf.CFStringGetTypeID():
+                return None
+            buf = ctypes.create_string_buffer(2048)
+            if self._cf.CFStringGetCString(ref, buf, 2048, 0x08000100):
+                return buf.value.decode("utf-8", "replace")
+            return None
+
+        def number_of(dct, key):
+            ref = value(dct, key)
+            if not ref or self._cf.CFGetTypeID(ref) != self._cf.CFNumberGetTypeID():
+                return None
+            out = ctypes.c_longlong()
+            if self._cf.CFNumberGetValue(ref, 4, ctypes.byref(out)):
+                return int(out.value)
+            return None
+
+        try:
+            for index in range(self._cf.CFArrayGetCount(arr)):
+                dct = self._cf.CFArrayGetValueAtIndex(arr, index)
+                number = number_of(dct, keys["kCGWindowNumber"])
+                bounds_ref = value(dct, keys["kCGWindowBounds"])
+                if number is None or not bounds_ref or self._cf.CFGetTypeID(bounds_ref) != self._cf.CFDictionaryGetTypeID():
+                    continue
+                rect_values = {name: number_of(bounds_ref, key) for name, key in bkeys.items()}
+                if any(item is None for item in rect_values.values()):
+                    continue
+                windows.append(WindowInfo(
+                    id=number,
+                    owner=text_of(dct, keys["kCGWindowOwnerName"]) or "",
+                    title=text_of(dct, keys["kCGWindowName"]),
+                    rect=Rect(float(rect_values["X"]), float(rect_values["Y"]),
+                              float(rect_values["Width"]), float(rect_values["Height"])),
+                    layer=number_of(dct, keys["kCGWindowLayer"]) or 0,
+                ))
+        finally:
+            for key in list(keys.values()) + list(bkeys.values()):
+                self._cf.CFRelease(key)
+            self._cf.CFRelease(arr)
+        return windows
+
+    def inspect_window(self, process_name: str, title_contains: str = "") -> dict[str, Any] | None:
+        """Read-only window lookup. Never focuses or raises anything."""
+        windows = [
+            item for item in self._cg_windows()
+            if item.owner.casefold() == str(process_name).casefold() and item.layer == 0
+        ]
+        if not windows:
+            return None
+        if title_contains:
+            titled = [item for item in windows if item.title and title_contains in item.title]
+            if titled:
+                windows = titled
+            elif any(item.title for item in windows):
+                return None
+        chosen = max(windows, key=lambda item: item.rect.w * item.rect.h)
+        return {"id": chosen.id, "title": chosen.title or "", "rect": chosen.rect, "layer": chosen.layer}
+
+    def capture_window(self, window_id: int, dest: Path) -> Path:
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
             dest.parent.chmod(0o700)
         except OSError:
             pass
-        x = max(0, int(round(rect.x)))
-        y = max(0, int(round(rect.y)))
-        w = max(1, int(round(rect.w)))
-        h = max(1, int(round(rect.h)))
         result = self._run(
-            [SCREENCAPTURE, "-x", "-o", "-R", f"{x},{y},{w},{h}", str(dest)], timeout=30
+            [SCREENCAPTURE, "-x", "-o", "-l", str(int(window_id)), str(dest)], timeout=30
         )
         if result.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
-            raise ScreenError(f"screencapture failed: {result.stderr.strip()[:200]}")
+            raise ScreenError(
+                "screencapture -l failed; grant Screen Recording to this app "
+                f"({result.stderr.strip()[:160]})"
+            )
         dest.chmod(0o600)
         return dest
 
@@ -193,27 +282,38 @@ end tell'''
         dest: Path,
         region: tuple[float, float, float, float] | None = None,
     ) -> Capture:
-        window = self.window(process_name, title_contains)
+        window = self.inspect_window(process_name, title_contains)
         if window is None:
-            raise ScreenError(f"window not found: {process_name!r}")
+            raise ScreenError(f"window not found (read-only): {process_name!r}")
         bounds: Rect = window["rect"]
-        if region:
-            rx, ry, rw, rh = region
-            absolute = Rect(bounds.x + rx, bounds.y + ry, rw, rh)
-        else:
-            absolute = bounds
-        if absolute.x < 0 or absolute.y < 0:
-            raise ScreenError("window is partly off-screen; move it fully onto the display")
-        self.capture_region(absolute, dest)
+        self.capture_window(window["id"], dest)
         scale = 1.0
         try:
             from PIL import Image  # type: ignore
 
             with Image.open(dest) as image:
-                if absolute.w > 0:
-                    scale = image.width / absolute.w
+                image.load()
+                if bounds.w > 0:
+                    scale = image.width / bounds.w
+                if region:
+                    rx, ry, rw, rh = region
+                    box = (
+                        max(0, int(round(rx * scale))), max(0, int(round(ry * scale))),
+                        min(image.width, int(round((rx + rw) * scale))),
+                        min(image.height, int(round((ry + rh) * scale))),
+                    )
+                    image.crop(box).save(dest)
+        except ImportError as exc:
+            if region:
+                raise ScreenError("Pillow is required for cropped window captures") from exc
         except Exception:
-            pass
+            if region:
+                raise
+        if region:
+            rx, ry, rw, rh = region
+            absolute = Rect(bounds.x + rx, bounds.y + ry, rw, rh)
+        else:
+            absolute = bounds
         return Capture(path=dest, window=bounds, region=absolute, scale=scale)
 
     # --- input ------------------------------------------------------------
@@ -231,6 +331,27 @@ end tell'''
         lib.CGEventGetLocation.argtypes = [ctypes.c_void_p]
         lib.CGEventGetLocation.restype = _CG_POINT
         self._cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cg = self._cg
+        cg.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        cg.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+        cf = self._cf
+        cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+        cf.CFArrayGetCount.restype = ctypes.c_long
+        cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+        cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+        cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        cf.CFNumberGetValue.restype = ctypes.c_bool
+        cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+        cf.CFGetTypeID.restype = ctypes.c_ulong
+        cf.CFStringGetTypeID.restype = ctypes.c_ulong
+        cf.CFNumberGetTypeID.restype = ctypes.c_ulong
+        cf.CFDictionaryGetTypeID.restype = ctypes.c_ulong
 
     def _corner_check(self) -> None:
         if not bool(self.cfg.get("gui.corner_failsafe", True)):
@@ -242,6 +363,38 @@ end tell'''
         width, height = size
         if (x <= 3 and y <= 3) or (x >= width - 4 and y <= 3) or (x <= 3 and y >= height - 4) or (x >= width - 4 and y >= height - 4):
             raise PauseRequested("mouse is in a screen corner (failsafe)")
+
+    def click_button(self, process_name: str, title_contains: str, label: str) -> bool:
+        """Click a button by Accessibility label. Never focuses or raises the window."""
+        script = f'''
+tell application "System Events"
+    if not (exists process "{_as_escape(process_name)}") then return "NO_PROCESS"
+    tell process "{_as_escape(process_name)}"
+        repeat with w in windows
+            try
+                if "{_as_escape(title_contains)}" is "" or ((name of w as string) contains "{_as_escape(title_contains)}") then
+                    repeat with e in (entire contents of w)
+                        try
+                            if class of e is button then
+                                set nm to ""
+                                try
+                                    set nm to name of e as string
+                                end try
+                                if nm is "{_as_escape(label)}" then
+                                    perform action "AXPress" of e
+                                    return "CLICKED"
+                                end if
+                            end if
+                        end try
+                    end repeat
+                end if
+            end try
+        end repeat
+    end tell
+end tell
+return "NOT_FOUND"'''
+        result = self._run([OSASCRIPT, "-e", script], timeout=20)
+        return result.returncode == 0 and result.stdout.strip() == "CLICKED"
 
     def click(self, x: float, y: float) -> None:
         self._corner_check()

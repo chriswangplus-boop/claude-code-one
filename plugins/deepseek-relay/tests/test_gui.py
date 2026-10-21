@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from relay.errors import AppMismatch, RecoveryFailed
+from relay.errors import AppMismatch, HumanRequired, RecoveryFailed
 from relay.gui import FakeAppDriver, Popup, pointer_role, pointer_round
 from relay.gui.app_driver import Calibration, GuiAppDriver
 from relay.gui.recovery import Recovery
@@ -12,7 +12,12 @@ from relay.policy import choose_button, decide_popup
 
 
 def test_popup_allow_list_rules():
-    allow = ["read file", "run tests", "git diff", "git commit", "git status", "git add", "edit file in project"]
+    allow = [
+        r"^allow .* to read (?:a )?file(?: .*)?\??$",
+        r"^allow .* to edit (?:a )?file in (?:the )?project(?: .*)?\??$",
+        r"^run (?:the )?tests?(?: .*)?\??$",
+        r"^allow git (status|diff|add|commit)(?: .*)?\??$",
+    ]
     assert decide_popup(Popup("Allow Claude to read file src/app.py?", ["Allow", "Deny"]), allow) == "approve"
     assert decide_popup(Popup("Run tests in the project?", ["Run", "Cancel"]), allow) == "approve"
     assert decide_popup(Popup("Allow network access to install packages?", ["Allow", "Deny"]), allow) == "human"
@@ -24,12 +29,30 @@ def test_popup_allow_list_rules():
     assert choose_button(Popup("x", ["Allow once", "Deny"])) == "Allow once"
 
 
+def test_chained_shell_commands_are_never_approved():
+    allow = [r"^run (?:the )?tests?(?: .*)?\??$"]
+    exploits = [
+        'Allow Bash: git diff && bash -c "$(echo cm0gLXIgfg== | base64 -d)"?',
+        "Run tests? pytest; rm -r ~/Documents",
+        "Allow Bash: git commit -m wip && python3 exfil.py",
+        "Allow Bash: git diff > /tmp/leak",
+        "Allow Bash: git diff\nrm -rf ~",
+    ]
+    for text in exploits:
+        assert decide_popup(Popup(text, ["Allow", "Deny"]), allow) == "human", text
+    assert decide_popup(Popup("Allow Bash: git diff", ["Allow", "Deny"]), allow) == "approve"
+    assert decide_popup(Popup("Run pytest -q", ["Run", "Cancel"]), allow) == "approve"
+
+
 class FakeBackend:
     def __init__(self):
         self.clicks: list[tuple[float, float]] = []
+        self.button_clicks: list[str] = []
         self.typed: list[str] = []
         self.pressed: list[tuple[str, list[str]]] = []
         self.rect = Rect(100, 50, 800, 600)
+        self.capture_same = False
+        self.capture_seq = 0
 
     def window(self, process, title):
         return {"title": "Claude", "rect": self.rect}
@@ -40,13 +63,21 @@ class FakeBackend:
     def capture(self, process, title, dest, region=None):
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        if self.capture_same:
+            dest.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        else:
+            self.capture_seq += 1
+            dest.write_bytes(b"\x89PNG\r\n\x1a\nfake" + bytes([self.capture_seq % 256]))
         actual = Rect(self.rect.x + (region[0] if region else 0), self.rect.y + (region[1] if region else 0),
                       region[2] if region else self.rect.w, region[3] if region else self.rect.h)
         return Capture(path=dest, window=self.rect, region=actual, scale=2.0)
 
     def click(self, x, y):
         self.clicks.append((x, y))
+
+    def click_button(self, process, title, label):
+        self.button_clicks.append(label)
+        return True
 
     def type_ascii(self, text):
         self.typed.append(text)
@@ -107,20 +138,32 @@ def test_model_verification(ctx):
     driver2, _ = make_driver(ctx, vision=lambda image, kind, question: {
         "model": "Sonnet 5.5", "effort": "high", "matches": False, "confidence": 0.9,
     })
-    with pytest.raises(AppMismatch, match="model label"):
+    with pytest.raises(HumanRequired, match="model label"):
         driver2.select_model("Opus 5.5", "medium")
 
 
-def test_popup_points_are_converted_to_screen_coordinates(ctx):
-    driver, _ = make_driver(ctx, vision=lambda image, kind, question: {
+def test_model_picker_that_does_not_open_never_types(ctx):
+    driver, backend = make_driver(ctx, vision=lambda image, kind, question: {
+        "model": "Opus 5.5", "effort": "medium", "matches": True, "confidence": 0.9,
+    })
+    backend.capture_same = True
+    with pytest.raises(HumanRequired, match="did not visibly open"):
+        driver.select_model("Opus 5.5", "medium")
+    assert backend.typed == []
+    assert backend.pressed == []
+
+
+def test_popup_clicks_by_label_and_ignores_vision_points(ctx):
+    driver, backend = make_driver(ctx, vision=lambda image, kind, question: {
         "present": True, "text": "Allow Claude to read file src/app.py?", "buttons": ["Allow", "Deny"],
-        "button_points": {"Allow": [200, 100]}, "confidence": 0.9,
+        "button_points": {"Allow": [999, 999]}, "confidence": 0.9,
     })
     popup = driver.read_popup()
     assert popup is not None and popup.buttons == ["Allow", "Deny"]
-    assert popup.button_points["Allow"] == (210.0, 110.0)
+    assert popup.button_points == {}
     driver.click_popup(popup, "Allow")
-    assert (210.0, 110.0) in driver.backend.clicks
+    assert backend.button_clicks == ["Allow"]
+    assert backend.clicks == []
 
 
 def test_context_and_verification(ctx):
@@ -167,3 +210,31 @@ def test_pointer_helpers():
     assert pointer_round("RELAY round 3 role=reviewer: x") == 3
     assert pointer_role("RELAY seed role=coder: x") == "coder"
     assert pointer_round("RELAY seed role=coder: x") is None
+
+
+def test_window_capture_uses_window_id_not_screen_region(tmp_path, monkeypatch):
+    import sys
+    if sys.platform != "darwin":
+        pytest.skip("macOS-only capture command")
+    from relay.gui.screen import MacOSBackend
+
+    backend = MacOSBackend.__new__(MacOSBackend)
+    calls = []
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(args, timeout=20):
+        calls.append(args)
+        Path(args[-1]).write_bytes(b"png")
+        return Result()
+
+    backend._run = fake_run
+    dest = tmp_path / "window.png"
+    backend.capture_window(4242, dest)
+    assert calls
+    assert "-l" in calls[0]
+    assert "4242" in calls[0]
+    assert "-R" not in calls[0]

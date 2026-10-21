@@ -28,7 +28,11 @@ class Recovery:
                 continue
             popup = self.driver.read_popup()
             if popup is not None and (popup.text or popup.buttons):
-                if decide_popup(popup, list(self.cfg.get("popup_allow_list", []))) == "approve":
+                if decide_popup(
+                popup,
+                list(self.cfg.get("popup_allow_list", [])),
+                list(self.cfg.get("popup_allow_commands", [])),
+            ) == "approve":
                     button = choose_button(popup)
                     if button:
                         self.driver.click_popup(popup, button)

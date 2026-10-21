@@ -19,9 +19,10 @@ from .config import (
     set_secret, sync_warning,
 )
 from .context import Context, open_project
-from .decisions import accept_decision, record_instruction
+from .decisions import accept_decision, confirm_human, record_instruction
 from .errors import ConfigError, RelayError, StateError
 from .integrity import prune_screens
+from .model_policy import opus_usage
 from .monitor import Monitor
 from .notify import Notifier
 from .orchestrator import Orchestrator
@@ -128,12 +129,27 @@ def _runtime(ctx: Context, args) -> tuple[dict, Brain | None, bool]:
     from .gui.screen import backend_for
 
     status = shared_folder_status(ctx.paths)
-    if all(status["proofs"].values()) and not status["same_folder"]:
+    if not all(status["proofs"].values()):
+        raise ConfigError(
+            "calibration self-test is incomplete: both .relay/CALIBRATION_claude.json and "
+            ".relay/CALIBRATION_zcode.json are required. Run `relay calibrate` for each app."
+        )
+    if not status["same_folder"]:
         raise ConfigError(
             "the calibration proofs disagree about the working folder: "
             f"{status['proofs']}. Both apps must open the same project folder."
         )
     backend = backend_for(ctx.cfg, ctx.journal)
+    permissions = backend.permissions()
+    missing = [name for name, ok in permissions.items() if not ok]
+    if missing:
+        raise ConfigError(
+            "macOS permissions missing: " + ", ".join(missing) + ". Open System Settings > "
+            "Privacy & Security and grant Accessibility, Screen Recording, and Automation "
+            "(System Events) to the app that launches Relay. Then QUIT and RELAUNCH that app: "
+            "macOS caches Screen Recording at process launch, so the running process cannot pick "
+            "up a newly granted permission. Then run `relay start` again."
+        )
     brain = None
     vision = None
     if not bool(getattr(args, "no_brain", False)):
@@ -167,6 +183,9 @@ def _print_status(ctx: Context) -> None:
     print(f"monitor: {'alive' if age is not None and age < 60 else 'stale/missing'}"
           + (f" ({age:.0f}s)" if age is not None else ""))
     print(f"session rounds: {state.get('session_rounds')}")
+    opus = opus_usage(state, ctx.clock.now().astimezone().date().isoformat(), ctx.cfg)
+    print(f"Opus today: {opus['today']}/{opus['today_limit']}, "
+          f"this milestone: {opus['milestone']}/{opus['milestone_limit']}")
     if state.get("paused_reason"):
         print(f"paused: {state.get('paused_reason')}")
     halt = ctx.store.read_flag("halt")
@@ -182,6 +201,7 @@ def _print_status(ctx: Context) -> None:
         print(f"last instruction: {last_instruction.get('id')}  {last_instruction.get('text')}")
     if pending:
         print(f"pending decision: {pending.get('id')}  {pending.get('question')}")
+        print('  the one-time answer code is in the desktop notification; answer with `relay decide <id> --code <code> "..."`')
     print("recent:")
     for event in ctx.journal.all_events()[-6:]:
         print(f"  {event.get('id')}  {event.get('type')}")
@@ -271,7 +291,12 @@ def cmd_resume(args) -> int:
             "run `relay resume --clear-halt`."
         )
     if args.clear_halt:
+        previous = ctx.store.read_flag("halt") or {}
         ctx.store.clear_flag("halt")
+        ctx.journal.append(
+            "human.halt_cleared", actor="human",
+            detail={"previous_reason": previous.get("reason")},
+        )
     return _run_loop(ctx, args, resume=True)
 
 
@@ -389,6 +414,7 @@ def cmd_status(args) -> int:
             "milestone": state.get("milestone"),
             "baton": ctx.store.baton(),
             "spent_today_usd": ctx.journal.spend_for_day(),
+            "opus": opus_usage(state, ctx.clock.now().astimezone().date().isoformat(), ctx.cfg),
             "monitor_heartbeat_age": ctx.store.heartbeat_age(ctx.paths.monitor_heartbeat),
             "pending_decision": state.get("pending_decision"),
             "paused_reason": state.get("paused_reason"),
@@ -402,9 +428,17 @@ def cmd_instruct(args) -> int:
     ctx = _ctx(args)
     _initialized(ctx)
     state = ctx.store.load()
-    result = record_instruction(ctx, " ".join(args.text))
+    text = " ".join(args.text)
+    required = bool(ctx.cfg.get("security.require_instruction_confirmation", True))
+    if required and not confirm_human(f"Record this Relay instruction?\n\n{text[:300]}"):
+        raise ConfigError("instruction was not confirmed")
+    result = record_instruction(ctx, text, confirmed=True, opus=bool(getattr(args, "opus", False)))
     pending = state.get("pending_decision")
     print(f"{result['id']} recorded as a human instruction; both agents see it in DECISIONS.md on their next turn")
+    if not required:
+        print("warning: instruction confirmation is disabled in config; any process that can run relay can record an instruction")
+    if result.get("opus"):
+        print("also armed one Opus turn (it counts toward the model_policy limits)")
     if pending:
         print(f"note: decision {pending.get('id')} is still pending; answer it with `relay decide {pending.get('id')} \"...\"`")
     return 0
@@ -420,10 +454,22 @@ def cmd_decide(args) -> int:
     if args.decision_id.upper() != str(pending.get("id")).upper():
         raise ConfigError(f"pending decision is {pending.get('id')}, not {args.decision_id}")
     answer = " ".join(args.answer).strip()
-    result = accept_decision(ctx, answer)
+    result = accept_decision(ctx, answer, args.code)
     print(f"{result['id']} answered; Relay will continue at {result['phase']}")
     print("if the loop is not running, start it with `relay resume`")
     return 0
+
+
+def cmd_journal_repair(args) -> int:
+    ctx = _ctx(args)
+    _initialized(ctx)
+    result = ctx.journal.repair()
+    print(json.dumps(result, indent=2, default=str))
+    ok, errors = ctx.journal.verify()
+    print(f"journal chain: {'OK' if ok else 'BROKEN'}")
+    for error in errors[:10]:
+        print(f"  ! {error}")
+    return 0 if ok else 1
 
 
 def cmd_trace(args) -> int:
@@ -593,12 +639,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     instruct = sub.add_parser("instruct", parents=[common], help="record a new human instruction for both agents")
     instruct.add_argument("text", nargs="+")
+    instruct.add_argument("--opus", action="store_true", help="also run one Opus turn, by rule B2")
     instruct.set_defaults(func=cmd_instruct)
 
     decide = sub.add_parser("decide", parents=[common], help="answer a pending decision locally")
     decide.add_argument("decision_id")
+    decide.add_argument("--code", required=True, help="one-time code from the desktop notification")
     decide.add_argument("answer", nargs="+")
     decide.set_defaults(func=cmd_decide)
+
+    journal = sub.add_parser("journal", parents=[common], help="journal maintenance")
+    journal_sub = journal.add_subparsers(dest="journal_command", required=True)
+    journal_repair = journal_sub.add_parser("repair", help="quarantine a corrupt tail and repair the chain")
+    journal_repair.set_defaults(func=cmd_journal_repair)
 
     trace = sub.add_parser("trace", parents=[common], help="show the journal timeline")
     trace.add_argument("--round", type=int, default=None)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from string import Template
 from typing import Mapping
 
@@ -35,5 +36,5 @@ def render(template: str, values: Mapping[str, object]) -> str:
 
 def fence(text: str, label: str = "agent-output") -> str:
     """Wrap untrusted text so a forged closing tag cannot escape the block."""
-    cleaned = str(text).replace("</untrusted>", "[/untrusted]").replace("<untrusted", "[untrusted")
+    cleaned = re.sub(r"(?i)<\s*/?\s*untrusted", "[untrusted", str(text))
     return f'<untrusted source="{label}">\n{cleaned}\n</untrusted>'
