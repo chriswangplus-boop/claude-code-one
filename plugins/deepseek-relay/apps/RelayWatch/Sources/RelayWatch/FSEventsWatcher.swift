@@ -8,10 +8,10 @@ final class FSEventsWatcher {
     private var stream: FSEventStreamRef?
     private let paths: [String]
     private let latency: CFTimeInterval
-    private let handler: () -> Void
+    private let handler: ([String]) -> Void
     private let queue = DispatchQueue(label: "relay.watch.fsevents")
 
-    init(paths: [URL], latency: TimeInterval = 3.0, handler: @escaping () -> Void) {
+    init(paths: [URL], latency: TimeInterval = 3.0, handler: @escaping ([String]) -> Void) {
         self.paths = paths.map(\.path)
         self.latency = latency
         self.handler = handler
@@ -26,10 +26,12 @@ final class FSEventsWatcher {
             release: nil,
             copyDescription: nil
         )
-        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+        let callback: FSEventStreamCallback = { _, info, _, eventPaths, _, _ in
             guard let info else { return }
             let watcher = Unmanaged<FSEventsWatcher>.fromOpaque(info).takeUnretainedValue()
-            watcher.handler()
+            // With kFSEventStreamCreateFlagFileEvents, eventPaths is an array of file paths.
+            let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
+            watcher.handler(paths)
         }
         let flags = FSEventStreamCreateFlags(
             kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagIgnoreSelf

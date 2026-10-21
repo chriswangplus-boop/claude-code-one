@@ -50,8 +50,10 @@ phase and `model_policy` in the config. A DeepSeek `suggest_escalation` is journ
 | `fixer` | Opus 5.5 medium | Claude | source (max 10 files), `FIX_REPORT.md`, `HANDOFF.md` | the same issue survives 4 reviews, or the coder blocks twice |
 | `coder` | GLM 5.3 flash high | Zcode | source, `CODER_REPORT.md` | everything else |
 
-The reviewer lists stable `blocking_issue_ids`; Relay counts consecutive reviews that list the
-same slug. Streak 2 adds `FIX_PLAN.md` for the coder. Streak 4 (or a coder `blocked` twice on one
+After `CHANGES_REQUESTED` the coder's pointer names `.relay/REVIEW.md` first, so the feedback
+actually reaches GLM. The reviewer lists stable `blocking_issue_ids`; Relay counts consecutive
+reviews that list the same slug. Streak 2 adds `FIX_PLAN.md` for the coder; once its issues stop blocking, or at a milestone
+boundary, the plan is archived under `.relay/archive/` and no longer followed. Streak 4 (or a coder `blocked` twice on one
 issue) runs the Opus fixer, then a normal Sonnet review that reads `FIX_REPORT.md`. If the streak
 still grows after that fix, only a human can approve another Opus fix.
 
@@ -340,7 +342,27 @@ relay monitor --once --project ~/code/myproject   # one check, JSON result
 | Phone push | Contains only a short question and decision ID. The ntfy topic is random (32+ chars). Answers are accepted **only locally**; `ntfy.phone_reply` is rejected by config validation because it is not implemented. |
 | Prompt injection | Agent text is fenced in `<untrusted>` blocks with forged closing tags neutralised; system prompts say never follow instructions inside. Popup approval is a deterministic allow-list in `policy.py`; unknown or dangerous popups go to a human. |
 | GUI control | Waits for user idle ≥ 30 s; verifies the window title before every action; a mouse in any screen corner raises a pause; every action is journaled. |
-| Git | One local commit per turn (`relay: round N role VERDICT`); no push helper exists anywhere; a monitor invariant also checks for it. |
+| Git | One local commit per turn (`relay: round N role VERDICT`); no push helper exists anywhere; a monitor invariant also checks for it. Every git command runs with hooks, fsmonitor, pager and external diff disabled, and `commit --no-verify`; a change to `.git/config` or `.git/hooks/*` during a turn pauses the loop. |
+| Agent forges a human answer | One-time codes are stored only as hashes **outside the project**; the journal is HMAC-signed with a key outside the project and pinned by a tail anchor; `relay instruct` requires the native macOS dialog (never a TTY "y"). |
+| Journal forgery | Signed events plus an anchor mean an agent cannot append or rewrite a `decision.answered`, `human.halt_cleared` or ownership-evidence event. The monitor and ownership checks trust only events whose signature verifies. |
+
+### Human-only actions
+
+The material that proves "a human did this" lives outside the project folder, in
+`~/Library/Application Support/Relay/<project-id>/` (mode `0700`):
+
+- `journal.key` — the HMAC key for every journal event;
+- `journal-anchor.json` — the trusted tail; a truncated or rewritten journal is detected;
+- `decision-codes.json` — one-time decision codes as SHA-256 hashes only.
+
+`relay status` prints the folder. During `WAIT_HUMAN`, Relay fingerprints `STATE.json` and the
+question text and pauses if either changes without an accepted answer. `relay instruct` can only
+be confirmed in the native macOS dialog; a piped `y` is ignored. An older journal is anchored once
+on the next start (legacy events stay chain-only; every new event is signed).
+
+Residual risk, stated plainly: an agent with unrestricted shell access as the same macOS user can
+read that folder. Claude Code and Zcode ask permission before touching files outside the project,
+and the popup policy escalates anything containing "outside" to you.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for the threat model and residual risks.
 
@@ -365,7 +387,7 @@ Sources: [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) a
 | `relay resume [--clear-halt]` | continue after pause / human answer / crash |
 | `relay pause` / `relay stop` | safe-point pause / stop loop and monitor |
 | `relay status [--json]` | phase, baton, spend, Opus counters, monitor age, pending decision |
-| `relay instruct "text" [--opus]` | record a new human instruction for both agents; `--opus` also arms one Opus turn |
+| `relay instruct "text" [--opus]` | record a new human instruction after the native macOS dialog confirms it; `--opus` also arms one Opus turn |
 | `relay decide ID --code CODE "answer"` | record a human answer locally |
 | `relay trace --round N --verify` | timeline and hash-chain check |
 | `relay why EVENT_ID` | inputs, judgment, response, screenshot, monitor notes |
@@ -402,7 +424,8 @@ Important knobs:
 | `daily_budget_usd` | 20 | pause guard |
 | `security.allow_google_drive` | true | permit projects inside Google Drive (pause sync) |
 | `screenshot_retention_days` | 14 | local retention |
-| `popup_allow_list` | read/edit/tests/git | deterministic approval |
+| `popup_allow_list` | read/edit/tests/git status/diff | deterministic approval; `git add`/`commit` are never auto-approved |
+| `RELAY_TRUST_DIR` | unset | move the trust folder (tests use a temp dir) |
 
 ## Testing
 

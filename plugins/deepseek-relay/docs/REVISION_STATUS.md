@@ -5,16 +5,15 @@
 - No Relay loop is running; there is nothing to pause.
 - Part A work is committed locally at `deepseek-relay-part-a` (first commit `23b7f0e`, remainder after it).
 - Patch: `reviews/deepseek-relay-part-a.patch` (applies to PR #5 `85072b9`).
-- Tests: **167 passed** (Python) and **20 passed** (`swift test`).
+- Tests: **195 passed** (Python) and **24 passed** (`swift test`).
 - Resume from the workspace root file `CONTINUE_HERE.md`.
 - Remaining: push the branch (no credential on this Mac), the real-app calibration checks, and the
   full 30-minute Activity Monitor energy reading.
 
 Base: `plugins/deepseek-relay` at PR #5 head `85072b9` (code + `CLAUDE_REVIEW.md` + `REVISION_PLAN.md`).
 
-`pytest`: **167 passed** on macOS (Linux run pending; P3-22's fake backend keeps it portable).
-`swift test`: **20 passed** in `apps/RelayWatch`. This file is a handoff, not a substitute for
-the review tests.
+`pytest`: **195 passed** on macOS. `swift test`: **24 passed** in `apps/RelayWatch`. This file is
+a handoff, not a substitute for the review tests.
 
 ## Fixed with regression tests
 
@@ -92,6 +91,55 @@ the review tests.
   (text and `--json`) shows `Opus today: x/3, this milestone: y/1`.
 - **B5 tests 1–11** are in `tests/test_model_policy.py` and `tests/test_integrity.py`, including
   the two-milestone acceptance run: Opus only for the first plan and one forced streak-4 fixer.
+
+## Review #2 (done) — base `897eee3`
+
+Review #2's verdict was FIX-FIRST with three P1s. All findings are fixed, in its suggested order.
+
+- **N2 (git hooks/config).** Every git command runs with `core.hooksPath=/dev/null`,
+  `core.fsmonitor=false`, `core.pager=cat`, `commit --no-verify` and `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_TERMINAL_PROMPT=0`, empty `GIT_EXTERNAL_DIFF`. `git_control_snapshot` hashes
+  `.git/config`, `.git/info/attributes`, `.gitmodules` and `.git/hooks/*` across each turn; a
+  change is an `integrity.violation` (`kind: git_control`) and pauses. Tests plant a pre-commit
+  hook and a `core.fsmonitor` command and assert neither runs, plus a mid-turn hook pause.
+- **N3 (coder never sees the review).** After `CHANGES_REQUESTED`, the CODE pointer names
+  `.relay/REVIEW.md` first with its sha256; `RULES_CODER.md` says to address every requested
+  change. The test coder parses the pointer, reads only the named files, and its report quotes the
+  review.
+- **N1 (human-only actions).** A `trust` store outside the project
+  (`~/Library/Application Support/Relay/<project-id>/`, 0700) holds the journal HMAC key, the
+  trusted tail anchor and the decision-code hashes. Every journal event is signed; `verify()`
+  checks chain, hash, signature and anchor; ownership evidence and the monitor use only
+  `trusted_events()`. `STATE.json` keeps only the decision id. `relay instruct` only accepts the
+  native macOS dialog (stdin is never read). During `WAIT_HUMAN`, a fingerprint of `STATE.json`
+  and the question text (the human's ANSWER line excluded) detects tampering and pauses. Tests
+  reproduce the three review paths (rewriting `STATE.json` + ANSWER, a piped "y", a forged chained
+  `decision.answered`/`human.halt_cleared`) and assert each fails.
+- **N4 (stale FIX_PLAN).** The plan is followed only while its issues still block; on resolution
+  or at a milestone boundary it is moved to `.relay/archive/FIX_PLAN-<round>.md` (journal
+  `fix.plan_archived`, committed), and the pointer stops naming it. Test drives it to resolution.
+- **N5 (uncounted Opus checkpoint turns).** `strategist`/`fixer` chats are never checkpointed or
+  rolled over; they always get a fresh chat and their outcome is in `STRATEGY.md`/`FIX_REPORT.md`.
+  Test asserts the Opus turn count equals `model.escalated` and no fixer/strategist checkpoint
+  exists.
+- **N6 (popup text/arguments).** The dialog text and buttons come from Accessibility
+  (`read_dialog`); an unreadable dialog raises `HumanRequired` instead of approving. Command
+  arguments reject `--output`/`-o`, `--ext-diff`, `-c`, `--no-verify`, `-p`, `--rootdir`,
+  absolute paths and `.git/…`; `git add`/`git commit` are no longer auto-approved. Tests cover the
+  five review strings and the AX path (no screenshot/vision).
+- **N7 (Relay Watch green after a stop / heartbeat wakes).** The watcher covers only
+  `.relay/journal` day files plus `STATE.json`/`PENDING_DECISION.md`; heartbeat, screenshot and
+  call-record paths are filtered. A one-shot timer at heartbeat + 5 min recomputes the glyph so a
+  dead orchestrator turns it red with no new event. Swift tests cover both.
+- **N8 (slug reuse).** The reviewer pointer lists the previous blocking ids and the previous
+  review, so slugs do not drift. Test checks the pointer.
+- **N9** the Opus counter and `pending` now land in one mutate; a crash+resume does not count
+  twice (test). **N10** the first turn also checks uncommitted user edits (test). **N11** the
+  Automation permission is probed with a real System Events call, separately from Accessibility,
+  which uses `AXIsProcessTrusted` (tests).
+
+Journal migration: an old (unsigned) journal is anchored once on the next start; events after the
+anchor must be signed. See `docs/OPERATIONS.md` (trust folder) and `docs/SECURITY.md`.
 
 ## Part C — Relay Watch (done)
 

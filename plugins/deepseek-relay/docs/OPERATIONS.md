@@ -17,7 +17,8 @@
 
 ## During a run
 
-- `relay status` is safe to run at any time; it only reads.
+- `relay status` is safe to run at any time; it only reads. It also prints the trust folder that
+  holds the decision codes and journal key.
 - `relay pause` stops at the next safe point. `relay resume` continues. Bind a macOS Shortcut
   to `relay pause` if you want a global hotkey; there is no built-in one.
 - Planner, reviewer, strategist and fixer are separate chats in the same app. Relay opens a
@@ -67,10 +68,12 @@ relay instruct "keep JSON; add CSV export" --project ~/code/myproject
 It is appended to `DECISIONS.md` with a `decision.answered` journal event. Both agents read it on
 their next turn. To make it take effect during a turn, pause first and resume afterwards.
 
-`relay instruct` asks for confirmation (TTY `y/N` or a macOS dialog). If you are driving Relay
-unattended and accept the risk, set `security.require_instruction_confirmation=false`; otherwise a
-prompt-injected agent could record its own instruction. The dialog does not pause the loop, but it
-can steal focus, so avoid running it mid-turn.
+`relay instruct` always asks for confirmation in the native macOS dialog. It never reads stdin,
+because an agent can hand a command a pseudo-TTY (`echo y | script -qc "relay instruct ..."`); that
+hole is closed. If you are driving Relay unattended and accept the risk, set
+`security.require_instruction_confirmation=false`; otherwise a shell-capable agent could record its
+own instruction. The dialog does not pause the loop, but it can steal focus, so avoid running it
+mid-turn.
 
 ## Model policy and Opus limits
 
@@ -92,6 +95,19 @@ If a round cap is reached, Relay also asks: **Raise the cap** (adds at least 3 r
 `STATE.json`), **Re-plan** (starts a new cycle and restarts the milestone round count), or **Stop
 for now**. There is no config edit to make and no unpickable pause.
 
+## The trust folder
+
+Decision codes and the journal key are stored outside the project, in
+`~/Library/Application Support/Relay/<project-id>/` (`journal.key`, `journal-anchor.json`,
+`decision-codes.json`; folder `0700`, files `0600`). `relay status` prints the exact path, and
+`RELAY_TRUST_DIR` moves it (tests use a temp dir).
+
+- Do not copy this folder into the project, a repo, or a cloud-synced backup.
+- Deleting it invalidates the decision codes and the journal anchor. Relay re-anchors an old
+  journal once on the next start (older events stay chain-only); every new event is signed.
+- Losing `journal.key` means existing signatures can no longer be verified. Keep the project's
+  `.relay/` and this folder together in a backup if you back up at all.
+
 ## Failure playbook
 
 | Symptom | What to do |
@@ -101,6 +117,10 @@ for now**. There is no config edit to make and no unpickable pause.
 | `PAUSED: DeepSeek context guard` | The call ID is in the message. `relay why CALL_ID`; start a fresh host session if applicable; `relay resume`. |
 | `PAUSED: daily budget` | Inspect `relay status`; raise `daily_budget_usd` deliberately or wait for the next day. |
 | `PAUSED: ownership violation` | An agent wrote another role's file. Read the journal event; revert the file if needed; `relay resume`. The monitor will also halt on this. |
+| `PAUSED: git control file changed` | An agent planted a hook, fsmonitor or `.git/config` change during a turn. Nothing ran (hooks are disabled). Inspect `.git/hooks` and `.git/config`, remove the change, then `relay resume`. |
+| `PAUSED: decision tampering detected` | `STATE.json` or the question text changed while Relay waited for you. Inspect the project and the trust folder; the decision was not accepted. Restore `STATE.json` from git if needed, then `relay resume`. |
+| `WAIT_HUMAN: dialog could not be read` | Accessibility/Automation failed while a dialog was open. Nothing was approved. Check the permissions, close the dialog yourself, then resume. |
+| `relay instruct` refuses to confirm | The native dialog was cancelled or macOS could not show it. Relay never accepts a piped "y". Run it from an interactive session. |
 | `PAUSED: secret scan` | A key or token is in a changed file. Remove/rotate it, then resume. The commit was not made. |
 | `WAIT_HUMAN: popup` | Approve/deny the dialog yourself, then answer with `relay decide` or resume after closing it. |
 | `WAIT_HUMAN: uncommitted changes` | Commit or stash your edits, then `relay resume`. |

@@ -18,6 +18,7 @@ from .clock import RealClock
 from .errors import JournalError
 from .paths import Paths
 from .state import FileLock, atomic_write_bytes, atomic_write_json, atomic_write_text
+from .trust import TrustStore
 from .util import canonical_json, sha256_text
 
 DAY_FILE = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
@@ -28,10 +29,18 @@ REQUIRED_FIELDS = ("id", "ts", "round", "actor", "type", "prev_hash", "hash")
 
 
 class Journal:
-    def __init__(self, paths: Paths, lock: FileLock, clock: RealClock | None = None):
+    def __init__(
+        self,
+        paths: Paths,
+        lock: FileLock,
+        clock: RealClock | None = None,
+        trust: TrustStore | None = None,
+    ):
         self.paths = paths
         self.lock = lock
         self.clock = clock or RealClock()
+        # Without a trust store (unit tests that build a Journal directly) events are unsigned.
+        self.trust = trust
 
     # --- writing ----------------------------------------------------------
     def new_call_id(self) -> str:
@@ -83,6 +92,9 @@ class Journal:
                 "prev_hash": prev_hash,
             }
             event["hash"] = sha256_text(canonical_json({k: v for k, v in event.items() if k != "hash"}))
+            # N1: the HMAC key lives outside the project; the hash chain alone is forgeable.
+            if self.trust is not None:
+                event["sig"] = self.trust.sign(event["hash"])
             path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(event, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -98,6 +110,9 @@ class Journal:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            if self.trust is not None:
+                # The anchor is the tail an agent cannot rewrite without the trust folder.
+                self.trust.set_anchor(str(event["id"]), str(event["hash"]))
             return event
 
     # --- reading ----------------------------------------------------------
@@ -165,6 +180,28 @@ class Journal:
 
     def all_events(self) -> list[dict]:
         return list(self.events())
+
+    def trusted_events(self) -> list[dict]:
+        """Events whose HMAC verifies. Ownership checks and the monitor trust only these."""
+        if self.trust is None:
+            return self.all_events()
+        out: list[dict] = []
+        for event in self.events(strict=False):
+            signature = event.get("sig")
+            if signature and self.trust.verify(str(event.get("hash") or ""), str(signature)):
+                out.append(event)
+        return out
+
+    def ensure_anchor(self) -> None:
+        """Migrate a legacy (unsigned) journal by anchoring its current tail once."""
+        if self.trust is None or self.trust.anchor() is not None:
+            return
+        try:
+            tail = self._tail_event()
+        except JournalError:
+            return
+        if tail:
+            self.trust.set_anchor(str(tail.get("id")), str(tail.get("hash")))
 
     def find(self, event_id: str) -> dict | None:
         for event in self.events():
@@ -293,6 +330,7 @@ class Journal:
     # --- integrity --------------------------------------------------------
     def verify(self) -> tuple[bool, list[str]]:
         errors: list[str] = []
+        parsed: list[dict] = []
         prev_hash: str | None = None
         seen: set[str] = set()
         for path in self._files():
@@ -311,7 +349,7 @@ class Journal:
                     errors.append(f"{where}: missing {', '.join(missing)}")
                 if prev_hash is not None and event.get("prev_hash") != prev_hash:
                     errors.append(f"{where}: prev_hash does not match previous event")
-                body = {k: v for k, v in event.items() if k != "hash"}
+                body = {k: v for k, v in event.items() if k not in ("hash", "sig")}
                 expected = sha256_text(canonical_json(body))
                 if event.get("hash") != expected:
                     errors.append(f"{where}: hash mismatch (line was modified)")
@@ -319,4 +357,24 @@ class Journal:
                     errors.append(f"{where}: duplicate event id {event.get('id')}")
                 seen.add(str(event.get("id")))
                 prev_hash = event.get("hash")
+                parsed.append(event)
+        if self.trust is not None:
+            anchor = self.trust.anchor()
+            if anchor:
+                ids = [str(event.get("id")) for event in parsed]
+                if anchor["event_id"] not in ids:
+                    errors.append(
+                        "trusted journal anchor event is missing (the journal was truncated or replaced)"
+                    )
+                else:
+                    index = ids.index(anchor["event_id"])
+                    if parsed[index].get("hash") != anchor["hash"]:
+                        errors.append("the trusted anchor hash does not match the journal")
+                    for event in parsed[index + 1:]:
+                        signature = event.get("sig")
+                        where = str(event.get("id"))
+                        if not signature:
+                            errors.append(f"{where}: unsigned event (not written by Relay)")
+                        elif not self.trust.verify(str(event.get("hash") or ""), str(signature)):
+                            errors.append(f"{where}: bad journal signature")
         return (not errors, errors)

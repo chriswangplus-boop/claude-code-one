@@ -58,9 +58,10 @@ def test_decide_answers_locally(tmp_path, capsys):
     code = new_code()
     state["pending_decision"] = {
         "id": "D-001", "question": "JSON or SQLite?", "return_to": "REVIEW", "round": 2,
-        "options": [], "code_hash": hash_code(code),
+        "options": [],
     }
     ctx.store.save(state)
+    ctx.trust.store_code("D-001", hash_code(code), {"round": 2})
     write_pending(
         ctx.paths, decision_id="D-001", question="JSON or SQLite?",
         context_lines=["storage choice"], options=[{"label": "JSON", "consequence": "simple"}],

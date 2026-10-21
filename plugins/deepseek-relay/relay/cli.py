@@ -180,6 +180,7 @@ def _print_status(ctx: Context) -> None:
     print(f"phase: {state.get('phase')}   round: {state.get('round')}   milestone: {state.get('milestone')}")
     print(f"baton: {baton.get('holder')} (round {baton.get('round')})   role: {state.get('role')}")
     print(f"spend today: ${ctx.journal.spend_for_day():.4f} / ${float(ctx.cfg.get('daily_budget_usd', 0)):.2f}")
+    print(f"trust: {ctx.trust.root}")
     print(f"monitor: {'alive' if age is not None and age < 60 else 'stale/missing'}"
           + (f" ({age:.0f}s)" if age is not None else ""))
     print(f"session rounds: {state.get('session_rounds')}")
@@ -242,6 +243,7 @@ def cmd_init(args) -> int:
             print("  .gitignore updated")
         return 0
     print(f"initialized {ctx.cfg.project_dir}")
+    print(f"  trust material (kept outside the project): {ctx.trust.root}")
     print(f"  created: {', '.join(result.get('created') or []) or 'nothing'}")
     if result.get("git_commit"):
         print(f"  baseline commit: {result['git_commit'][:12]}")
@@ -414,6 +416,7 @@ def cmd_status(args) -> int:
             "milestone": state.get("milestone"),
             "baton": ctx.store.baton(),
             "spent_today_usd": ctx.journal.spend_for_day(),
+            "trust_dir": str(ctx.trust.root),
             "opus": opus_usage(state, ctx.clock.now().astimezone().date().isoformat(), ctx.cfg),
             "monitor_heartbeat_age": ctx.store.heartbeat_age(ctx.paths.monitor_heartbeat),
             "pending_decision": state.get("pending_decision"),

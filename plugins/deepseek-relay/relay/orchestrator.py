@@ -24,9 +24,10 @@ from .errors import (
 )
 from .gui.base import AppDriver
 from .gui.recovery import Recovery
+from .gui.screen import ScreenError
 from .integrity import (
-    changed_paths, git_commit, git_snapshot, ownership_violations, read_sentinel,
-    secret_scan, snapshot, validate_sentinel,
+    changed_paths, git_commit, git_control_changes, git_control_snapshot, git_snapshot,
+    ownership_violations, read_sentinel, secret_scan, snapshot, validate_sentinel,
 )
 from .journal import Journal
 from .model_policy import (
@@ -82,6 +83,15 @@ def _issue_ids(sentinel: dict) -> list[str]:
     return seen[:10]
 
 
+def _strip_answer_line(text: str) -> str:
+    """Drop the human's ANSWER line: editing only that line is the intended way to answer."""
+    kept = [
+        line for line in str(text or "").splitlines()
+        if not line.strip().upper().startswith("ANSWER:")
+    ]
+    return "\n".join(kept)
+
+
 def _match_option(answer: str, options: list[dict]) -> str | None:
     """Match a free-form human answer to one option label, deterministically.
 
@@ -117,13 +127,13 @@ class Orchestrator:
         self.paths = ctx.paths
         self.store: StateStore = ctx.store
         self.journal: Journal = ctx.journal
+        self.trust = ctx.trust
         self.clock = ctx.clock
         self.drivers = drivers
         self.brain = brain
         self.notifier = notifier or _NullNotifier()
         self.monitor_required = monitor_required
         self.wall = wall or __import__("time").time
-        self._turns_completed = 0
         monitor_age = self.store.heartbeat_age(self.paths.monitor_heartbeat)
         self._monitor_seen = monitor_age is not None and monitor_age < float(
             self.cfg.get("monitor.heartbeat_stale_seconds", 300)
@@ -255,6 +265,8 @@ class Orchestrator:
     def _prepare(self) -> None:
         if not self.paths.state.exists():
             raise StateError("this project is not initialized; run `relay init` first")
+        # Migrate a legacy journal once: the HMAC anchor starts at today's tail.
+        self.journal.ensure_anchor()
         if self._first_prepare:
             self.store.mutate(lambda current: current.__setitem__("active_session", {}))
             self._first_prepare = False
@@ -298,7 +310,6 @@ class Orchestrator:
         self.store.mutate(stamp)
         state = self._state()
         self.store.heartbeat(phase=state.get("phase"), round=state.get("round", 0))
-        self._turns_completed = len(self.journal.of_type("turn.end"))
         try:
             self.journal.append(
                 "run.start",
@@ -552,11 +563,7 @@ class Orchestrator:
         return False
 
     def _user_edits_pending(self) -> bool:
-        if (
-            self._turns_completed == 0
-            or not bool(self.cfg.get("git.enabled", True))
-            or not bool(self.cfg.get("auto_commit", True))
-        ):
+        if not bool(self.cfg.get("git.enabled", True)) or not bool(self.cfg.get("auto_commit", True)):
             return False
         lines = git_snapshot(self.cfg.project_dir)
         # Relay and the monitor write these without a human; they are not user edits.
@@ -607,35 +614,30 @@ class Orchestrator:
             "effort_verified": result.get("effort_verified", "unverifiable"),
         }
 
-    def _record_escalation(self, choice, role: str, round_no: int) -> dict:
-        """Count an Opus turn and journal why it ran. Never called for a resumed turn."""
-        if not choice.escalated:
-            return {}
+    def _count_escalation(self, current: dict, choice) -> dict:
+        """Increment the Opus counters inside the caller's mutate (N9: atomic with pending)."""
         today = self._today()
-        counted: dict[str, int] = {}
+        milestone = int(current.get("milestone", 1))
+        opus = current.setdefault("opus", {})
+        if opus.get("date") != today:
+            opus["date"] = today
+            opus["day"] = 0
+        if int(opus.get("milestone", 0)) != milestone:
+            opus["milestone"] = milestone
+            opus["milestone_turns"] = 0
+        opus["day"] = int(opus.get("day", 0)) + 1
+        if not choice.exempt_milestone:
+            opus["milestone_turns"] = int(opus.get("milestone_turns", 0)) + 1
+        current["opus_override"] = None
+        current["human_opus_request"] = None
+        current["opus_declined"] = None
+        return {
+            "day": int(opus["day"]),
+            "milestone_turns": int(opus.get("milestone_turns", 0)),
+            "milestone": milestone,
+        }
 
-        def apply(current: dict) -> None:
-            milestone = int(current.get("milestone", 1))
-            opus = current.setdefault("opus", {})
-            if opus.get("date") != today:
-                opus["date"] = today
-                opus["day"] = 0
-            if int(opus.get("milestone", 0)) != milestone:
-                opus["milestone"] = milestone
-                opus["milestone_turns"] = 0
-            opus["day"] = int(opus.get("day", 0)) + 1
-            if not choice.exempt_milestone:
-                opus["milestone_turns"] = int(opus.get("milestone_turns", 0)) + 1
-            current["opus_override"] = None
-            current["human_opus_request"] = None
-            current["opus_declined"] = None
-            counted.update({
-                "day": opus["day"],
-                "milestone_turns": int(opus.get("milestone_turns", 0)),
-                "milestone": milestone,
-            })
-
-        self.store.mutate(apply)
+    def _journal_escalation(self, choice, role: str, round_no: int, counted: dict) -> None:
         p = policy(self.cfg)
         self.journal.append(
             "model.escalated", round_no=round_no,
@@ -657,7 +659,6 @@ class Orchestrator:
                 },
             },
         )
-        return counted
 
     def _turn(self, phase: str) -> None:
         state = self._state()
@@ -726,22 +727,24 @@ class Orchestrator:
             pointer = self._build_pointer(phase, role, round_no, state=state, choice=choice)
             started_wall = self.wall()
             started_epoch = self.clock.epoch()
+            # Anything that can make git run an agent's command is checked across the turn.
+            git_before = git_control_snapshot(self.cfg.project_dir)
             # Choose the model before typing anything: an unverified label raises HumanRequired.
             verified = self._select_model(role, model, effort)
             model_verified = verified["model_verified"]
             effort_verified = verified["effort_verified"]
-            self._record_escalation(choice, role, round_no)
             issue_ids = list(choice.issue_ids)
-            if getattr(choice, "fix_plan_issues", ()):
-                self.journal.append(
-                    "fix.plan_requested", round_no=round_no,
-                    detail={
-                        "issue_ids": list(choice.fix_plan_issues),
-                        "streak": int(choice.fix_plan_streak),
-                    },
-                )
+            plan_issues = list(getattr(choice, "fix_plan_issues", ()) or ())
+            counted: dict = {}
 
             def apply(current: dict) -> None:
+                # N9: the Opus counter and `pending` are in one save, so a crash cannot
+                # count the turn without an intent record (or the other way round).
+                if escalated:
+                    counted.update(self._count_escalation(current, choice))
+                if plan_issues:
+                    current["fix_plan_issues"] = plan_issues
+                    current["fix_plan_round"] = round_no
                 current["round"] = round_no
                 current["role"] = role
                 current["pending"] = {
@@ -761,6 +764,16 @@ class Orchestrator:
                 }
 
             self.store.mutate(apply)
+            if escalated:
+                self._journal_escalation(choice, role, round_no, counted)
+            if plan_issues:
+                self.journal.append(
+                    "fix.plan_requested", round_no=round_no,
+                    detail={
+                        "issue_ids": plan_issues,
+                        "streak": int(choice.fix_plan_streak),
+                    },
+                )
 
         driver = self.drivers[role_app(role)]
         sentinel_path = self.paths.sentinel(role)
@@ -824,6 +837,7 @@ class Orchestrator:
         self._process_turn(
             phase=phase, role=role, round_no=round_no, sentinel=sentinel, before=before, driver=driver,
             turn_start_id=turn_event["id"],
+            git_before=git_before if not resuming else None,
         )
 
     def _ensure_session(self, role: str, round_no: int, *, force_new: bool = False) -> None:
@@ -838,7 +852,12 @@ class Orchestrator:
         outgoing = active.get(app)
         if outgoing == role and not force_new:
             return
-        if app == "claude" and outgoing in CLAUDE_ROLES and (outgoing != role or force_new):
+        if (
+            app == "claude"
+            and outgoing in CLAUDE_ROLES
+            and outgoing not in ("strategist", "fixer")
+            and (outgoing != role or force_new)
+        ):
             if int(state.get("session_rounds", {}).get(str(outgoing), 0)) > 0:
                 self._checkpoint_before_switch(str(outgoing), round_no)
         driver = self.drivers[app]
@@ -891,7 +910,7 @@ class Orchestrator:
         after = snapshot(self.cfg.project_dir)
         violations = ownership_violations(
             before, after, outgoing, active_role=outgoing,
-            events=self.journal.all_events(), turn_start_id=start["id"],
+            events=self.journal.trusted_events(), turn_start_id=start["id"],
         )
         if violations:
             raise PauseRequested(f"checkpoint wrote files it does not own: {violations[0]['path']}")
@@ -927,9 +946,24 @@ class Orchestrator:
         before: dict[str, str],
         driver: AppDriver,
         turn_start_id: str | None = None,
+        git_before: dict[str, str] | None = None,
     ) -> None:
         after = snapshot(self.cfg.project_dir)
         changed = changed_paths(before, after)
+
+        if git_before is not None:
+            git_changed = git_control_changes(git_before, git_control_snapshot(self.cfg.project_dir))
+            if git_changed:
+                # A hook, fsmonitor or config change can make git run arbitrary code.
+                self.journal.append(
+                    "integrity.violation", state=phase, round_no=round_no,
+                    detail={"kind": "git_control", "paths": git_changed}, result="blocked",
+                )
+                self._abort_turn(
+                    "git control files changed during the turn: " + ", ".join(git_changed[:5]),
+                    phase, paths=git_changed,
+                )
+                raise PauseRequested("git control file changed during the turn")
         pending = self._state().get("pending") if isinstance(self._state().get("pending"), dict) else {}
         model = pending.get("model")
         effort = pending.get("effort")
@@ -955,7 +989,7 @@ class Orchestrator:
 
         violations = ownership_violations(
             before, after, role, active_role=role,
-            events=self.journal.all_events(), turn_start_id=turn_start_id,
+            events=self.journal.trusted_events(), turn_start_id=turn_start_id,
         )
         if violations:
             text = ", ".join(f"{v['path']} (owned by {v['owner']})" for v in violations[:5])
@@ -1011,6 +1045,7 @@ class Orchestrator:
         summary = str(sentinel.get("summary") or "")
         source_changed = any(not path.startswith(".relay/") for path in changed)
 
+        archive_plan: dict = {}
         is_decision = sentinel.get("status") in ("needs_decision", "blocked")
         double_blocked = False
         if role == "coder" and sentinel.get("status") == "blocked" and issue_ids:
@@ -1077,6 +1112,12 @@ class Orchestrator:
                 for key in issue_ids:
                     streaks[key] = int(streaks.get(key, 0)) + 1
                 current["last_review_issues"] = list(issue_ids)
+                planned = set(current.get("fix_plan_issues") or [])
+                live = set(current.get("issue_streaks") or {})
+                if (self.cfg.project_dir / ".relay/FIX_PLAN.md").exists() and (
+                    not planned or not (planned & live)
+                ):
+                    archive_plan["reason"] = "issues resolved"
             if role == "coder":
                 blocked = current.setdefault("blocked_streaks", {})
                 if sentinel.get("status") == "blocked" and issue_ids:
@@ -1122,7 +1163,8 @@ class Orchestrator:
                  "sha256": sha256_file(self.paths.sentinel(role))},
             ],
         )
-        self._turns_completed += 1
+        if archive_plan.get("reason"):
+            self._archive_fix_plan(round_no, str(archive_plan["reason"]))
 
         if is_decision:
             question = str(sentinel.get("question") or summary or f"{role} is blocked")
@@ -1137,6 +1179,10 @@ class Orchestrator:
 
     # --- rollover ---------------------------------------------------------
     def _maybe_rollover(self, role: str, round_no: int, *, boundary: bool) -> None:
+        if role in ("strategist", "fixer"):
+            # Opus turns always get a fresh chat and write their outcome to STRATEGY/FIX_REPORT;
+            # checkpointing them here would run an extra, uncounted Opus turn (N5).
+            return
         state = self._state()
         if role == "coder":
             max_rounds = int(self.cfg.get("zcode_app.max_rounds_per_session", 3))
@@ -1205,7 +1251,7 @@ class Orchestrator:
         after = snapshot(self.cfg.project_dir)
         violations = ownership_violations(
             before, after, role, active_role=role,
-            events=self.journal.all_events(), turn_start_id=rollover_start["id"],
+            events=self.journal.trusted_events(), turn_start_id=rollover_start["id"],
         )
         if violations:
             self._abort_turn(f"checkpoint wrote files it does not own: {violations[0]['path']}", self._state().get("phase"))
@@ -1264,6 +1310,41 @@ class Orchestrator:
             return "missing"
         return short_hash(sha256_file(path))
 
+    def _fix_plan_is_current(self, state: dict) -> bool:
+        """A FIX_PLAN.md is followed only while its issues are still blocking (N4)."""
+        if not (self.cfg.project_dir / ".relay/FIX_PLAN.md").exists():
+            return False
+        planned = set(state.get("fix_plan_issues") or [])
+        live = set(state.get("issue_streaks") or {})
+        return not planned or bool(planned & live)
+
+    def _archive_fix_plan(self, round_no: int, reason: str) -> None:
+        source = self.cfg.project_dir / ".relay/FIX_PLAN.md"
+        if not source.exists():
+            return
+        self.paths.archive_dir.mkdir(parents=True, exist_ok=True)
+        target = self.paths.archive_dir / f"FIX_PLAN-{round_no}.md"
+        suffix = 2
+        while target.exists():
+            target = self.paths.archive_dir / f"FIX_PLAN-{round_no}-{suffix}.md"
+            suffix += 1
+        digest = sha256_file(source)
+        source.replace(target)
+        rel = target.relative_to(self.cfg.project_dir).as_posix()
+        self.journal.append(
+            "fix.plan_archived", round_no=round_no,
+            detail={"reason": reason, "archived": rel, "sha256": digest},
+            outputs=[{"path": rel, "sha256": digest}],
+        )
+        self.store.mutate(lambda current: current.update({"fix_plan_issues": []}))
+        if bool(self.cfg.get("auto_commit", True)) and bool(self.cfg.get("git.enabled", True)):
+            commit = git_commit(self.cfg.project_dir, f"relay: archive FIX_PLAN after round {round_no}")
+            if commit:
+                self.journal.append(
+                    "git.commit", round_no=round_no,
+                    detail={"hash": commit, "message": "archive FIX_PLAN"},
+                )
+
     def _build_pointer(
         self, phase: str, role: str, round_no: int, *,
         state: dict | None = None, choice=None,
@@ -1271,7 +1352,7 @@ class Orchestrator:
         state = state or self._state()
         notes = ".relay/MONITOR_NOTES.md"
         decisions = ".relay/DECISIONS.md"
-        fix_plan = (self.cfg.project_dir / ".relay/FIX_PLAN.md").exists()
+        fix_plan = self._fix_plan_is_current(state)
         fix_plan_issues = ", ".join(getattr(choice, "fix_plan_issues", ()) or ())
         last_role = str((state.get("last_turn") or {}).get("role") or "")
         if phase == "PLAN":
@@ -1303,22 +1384,33 @@ class Orchestrator:
             )
         elif phase == "CODE":
             plan = f".relay/FIX_PLAN.md, " if fix_plan else ""
+            # N3: after CHANGES_REQUESTED the review IS the handoff for this turn.
+            review_first = (state.get("last_turn") or {}).get("verdict") == "CHANGES_REQUESTED"
+            review = (
+                f".relay/REVIEW.md (sha256 {self._hint('.relay/REVIEW.md')}), " if review_first else ""
+            )
             text = (
-                f"RELAY round {round_no} role=coder: read .relay/HANDOFF.md "
+                f"RELAY round {round_no} role=coder: read {review}.relay/HANDOFF.md "
                 f"(sha256 {self._hint('.relay/HANDOFF.md')}), {plan}.relay/PLAN.md, {decisions}, {notes} "
-                "and .relay/RULES_CODER.md. Write .relay/CODER_REPORT.md, then .relay/CODER_DONE.json last."
+                "and .relay/RULES_CODER.md. Address every requested change. Write "
+                ".relay/CODER_REPORT.md, then .relay/CODER_DONE.json last."
             )
         else:
             report = ".relay/FIX_REPORT.md" if last_role == "fixer" else ".relay/CODER_REPORT.md"
             plan = (
-                f" If a blocking issue repeats, also write .relay/FIX_PLAN.md for: {fix_plan_issues}."
+                f" If an issue repeats, also write .relay/FIX_PLAN.md for: {fix_plan_issues}."
                 if fix_plan_issues else ""
+            )
+            previous = [str(item) for item in (state.get("last_review_issues") or [])][:5]
+            previous_text = (
+                " Previous ids: " + ", ".join(previous) + " (reuse if same)."
+                if previous else ""
             )
             text = (
                 f"RELAY round {round_no} role=reviewer: read .relay/HANDOFF.md "
                 f"(sha256 {self._hint('.relay/HANDOFF.md')}), {report} (sha256 {self._hint(report)}), "
-                f".relay/PLAN.md, {decisions}, {notes} and .relay/RULES_CLAUDE.md (reviewer section)."
-                + plan +
+                f".relay/PLAN.md, {decisions}, {notes}, .relay/RULES_CLAUDE.md (reviewer)."
+                + previous_text + plan +
                 " Write .relay/REVIEW.md, then .relay/CLAUDE_DONE.json last."
             )
         return ascii_pointer(text)
@@ -1432,6 +1524,15 @@ class Orchestrator:
         except BrainError as exc:
             self.journal.append("vision.check", detail={"kind": "popup", "role": role, "error": str(exc)}, result="error")
             popup = None
+        except ScreenError as exc:
+            self.journal.append(
+                "vision.check", detail={"kind": "popup", "role": role, "error": str(exc)}, result="error"
+            )
+            raise HumanRequired(
+                "Relay could not read an approval dialog through Accessibility. Check the Automation "
+                "and Accessibility permissions, then resume. Nothing was approved.",
+                reason="dialog could not be read",
+            )
         if popup is not None:
             safe_text = truncate(redact(popup.text).text, 300)
             self.journal.append(
@@ -1693,6 +1794,8 @@ class Orchestrator:
                 "summary": summary,
             },
         )
+        if approval:
+            self._archive_fix_plan(int(state.get("round", 0)), "milestone")
         if target == "DONE":
             self.journal.append("project.done", round_no=state.get("round"), detail={"summary": summary})
             self._notify("Relay finished", "The project reported PROJECT_DONE.")
@@ -1738,6 +1841,10 @@ class Orchestrator:
             round_no = int(current.get("round", 0))
             return_to_value = return_to or current.get("phase")
             current["decisions"] = int(current.get("decisions", 0)) + 1
+            # Only the id is in the project; the code hash is in the external trust store.
+            self.ctx.trust.store_code(
+                decision_id, hash_code(code), {"round": round_no, "asked_at": asked_at}
+            )
             current["pending_decision"] = {
                 "id": decision_id,
                 "question": question,
@@ -1745,7 +1852,6 @@ class Orchestrator:
                 "round": round_no,
                 "return_to": return_to_value,
                 "asked_at": asked_at,
-                "code_hash": hash_code(code),
                 "kind": kind,
                 "data": data,
             }
@@ -1800,11 +1906,30 @@ class Orchestrator:
         )
         return decision_id
 
+    def _decision_fingerprint(self) -> tuple[str, str]:
+        state_digest = sha256_file(self.paths.state) if self.paths.state.exists() else ""
+        pending_digest = ""
+        if self.paths.pending_decision.exists():
+            try:
+                text = self.paths.pending_decision.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            pending_digest = sha256_text(_strip_answer_line(text))
+        return state_digest, pending_digest
+
+    def _decision_tampered(self, decision_id: str, reason: str) -> None:
+        self.journal.append(
+            "decision.tamper", detail={"id": decision_id, "reason": reason}, result="blocked"
+        )
+        self._pause(f"decision tampering detected: {reason}")
+
     def wait_for_decision(self) -> None:
         state = self._state()
         pending = state.get("pending_decision") or {}
         decision_id = pending.get("id")
         self.journal.append("decision.waiting", detail={"id": decision_id})
+        # N1 fix 4: any change to STATE.json or the question text while we wait is tampering.
+        baseline = self._decision_fingerprint()
         reminder_seconds = float(self.cfg.get("decision_reminder_hours", 4)) * 3600
         last_reminder = self.clock.epoch()
         last_bad_answer: str | None = None
@@ -1814,8 +1939,16 @@ class Orchestrator:
             self._check_wait_guards()
             state = self._state()
             if state.get("phase") != "WAIT_HUMAN":
+                last = state.get("last_decision") or {}
+                if str(last.get("id") or "") == str(decision_id):
+                    return
+                self._decision_tampered(decision_id, "phase moved without an accepted answer")
                 return
             if not state.get("pending_decision"):
+                last = state.get("last_decision") or {}
+                if str(last.get("id") or "") == str(decision_id):
+                    return
+                self._decision_tampered(decision_id, "pending decision cleared without an answer")
                 return
             parsed = local_answer(self.paths)
             if parsed:
@@ -1834,6 +1967,11 @@ class Orchestrator:
                     self.store.heartbeat(phase="WAIT_HUMAN", round=state.get("round", 0))
                     self.clock.sleep(float(self.cfg.get("decision_poll_seconds", 60)))
                     continue
+            if self._decision_fingerprint() != baseline:
+                self._decision_tampered(
+                    decision_id, "STATE.json or PENDING_DECISION.md changed while waiting"
+                )
+                return
             if reminder_seconds > 0 and self.clock.epoch() - last_reminder >= reminder_seconds:
                 code = self._decision_codes.get(str(decision_id))
                 self._notify(
@@ -1847,6 +1985,7 @@ class Orchestrator:
                 self.journal.append("decision.reminder", detail={"id": decision_id})
                 state["notification"]["last_sent_at"] = self.clock.now().isoformat()
                 self.store.save(state)
+                baseline = self._decision_fingerprint()
                 last_reminder = self.clock.epoch()
             if deadline is not None and self.clock.epoch() >= deadline:
                 self.journal.append("decision.timeout", detail={"id": decision_id}, result="still waiting")

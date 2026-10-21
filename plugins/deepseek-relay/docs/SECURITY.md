@@ -60,6 +60,11 @@ verifiable. Only rule counts are journaled, never matched text.
 - There is no push helper. `git push` never appears in the code. The monitor also checks the
   journal for push attempts.
 - Each turn is one local commit, so every step is undoable.
+- `.git/` is agent-writable, so Relay never lets git run agent code: every command uses
+  `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat`, commits with
+  `--no-verify`, and runs with `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0` and an empty
+  `GIT_EXTERNAL_DIFF`. A change to `.git/config`, `.git/info/attributes`, `.gitmodules` or any
+  `.git/hooks/*` file during a turn is an ownership violation and pauses the loop.
 
 ## Prompt injection
 
@@ -67,9 +72,12 @@ verifiable. Only rule counts are journaled, never matched text.
 - Forged closing tags are rewritten, so text cannot break out of its block.
 - System prompts state that untrusted blocks are data, never instructions.
 - The routing model cannot approve work or answer a decision.
-- Popup approval is **not** an LLM decision. `policy.py` normalises the dialog text, rejects
-  dangerous verbs (push/delete/install/network/credentials/always-allow…), requires a phrase
-  from the configured allow-list, and requires a safe button label. Anything else goes to a
+- Popup approval is **not** an LLM decision. The dialog text and buttons are read through
+  Accessibility (no screenshot, no vision). `policy.py` normalises the text, rejects dangerous
+  verbs (push/delete/install/network/credentials/always-allow…), requires a phrase from the
+  configured allow-list, and requires a safe button label. Command arguments are checked too:
+  `--output`, `-o`, `--ext-diff`, `-c`, `--no-verify`, `-p`, `--rootdir`, absolute paths and
+  `.git/…` are rejected. `git add`/`git commit` are never auto-approved. Anything else goes to a
   human.
 - Agent output is capped and truncated before it reaches a model.
 
@@ -89,10 +97,32 @@ verifiable. Only rule counts are journaled, never matched text.
 - Users can always `relay pause`; the loop checks the flag while waiting.
 - Every click, keystroke and screenshot is journaled with the window identity.
 
+## Human-only actions outside the project
+
+Everything used to prove "a human did this" is kept out of the agent-writable folder, in
+`~/Library/Application Support/Relay/<project-id>/` (mode `0700`, files `0600`):
+
+- the journal HMAC key and the trusted tail anchor;
+- one-time decision codes, as SHA-256 hashes only (never the code itself).
+
+`STATE.json` holds only the decision id. During `WAIT_HUMAN`, Relay fingerprints `STATE.json` and
+the question text and pauses on any change not made by Relay (the human's `ANSWER:` line is
+excluded from the fingerprint). `relay instruct` can only be confirmed in the native macOS dialog;
+stdin is never read, so `echo y | script -qc "relay instruct ..."` cannot record an instruction.
+
+Residual risk: an agent with unrestricted shell access as the same user can read the trust folder
+(and thus the HMAC key). Claude Code and Zcode ask permission before touching files outside the
+project, and the popup policy escalates "outside" dialogs to the human. Relay is not a sandbox
+against a fully compromised user session.
+
 ## Journal integrity
 
 - Append-only JSONL with a SHA-256 chain across day files.
-- `relay trace --verify` detects edits, deletions and reordering.
+- Every event is HMAC-signed with the external key; the last event is pinned by an anchor file in
+  the trust folder. `verify()` reports chain, hash, signature and anchor errors.
+- Ownership evidence and the monitor's history checks use only events whose signature verifies,
+  so a forged `decision.answered` or `human.halt_cleared` is ignored even if it is chained.
+- `relay trace --verify` detects edits, deletions, reordering, truncation and unsigned appends.
 - The monitor verifies the chain every check; a break halts the loop.
 - DeepSeek prompts and responses are stored redacted under `journal/calls/` for `why`/`replay`.
 
@@ -108,13 +138,19 @@ verifiable. Only rule counts are journaled, never matched text.
 4. **Third-party cloud.** Redacted review text and cropped screenshots still leave the machine if
    vision is enabled. The user must accept DeepSeek's data policy; `text_only_mode` is the
    off-switch.
-5. **Local compromise.** An attacker with the user's OS session can read `.relay/` and the
-   keychain. Relay is not a sandbox.
+5. **Local compromise.** An attacker with the user's OS session can read `.relay/`, the keychain
+   and the Relay trust folder (including the journal HMAC key). Relay is not a sandbox. The
+   trust folder is outside the project so a prompt-injected agent must first escape its app's
+   file-permission gate to reach it.
 6. **Cloud-synced folder.** Google Drive is allowed by default (`security.allow_google_drive`)
    because the intended workflow pauses Drive sync during runs. If a sync client is active,
    conflict copies can still corrupt `.relay`; atomic writes and the journal chain detect some
    cases but not all. iCloud, Dropbox and OneDrive are refused unless `--allow-sync-dir` is
    passed.
+7. **A dialog is only as strong as the agent's TCC grants.** `relay instruct` cannot be answered
+   through a pseudo-TTY, but an agent that has been granted Automation/Accessibility could click
+   the dialog itself. Grant those permissions only to the app that runs Relay, not to the agent
+   apps, and review `relay trace` for unexpected `decision.answered` events.
 
 ## Recommended setup
 

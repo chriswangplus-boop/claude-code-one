@@ -39,16 +39,13 @@ def _escape_applescript(text: str) -> str:
 def confirm_human(prompt: str) -> bool:
     """A local human gate for `relay instruct`.
 
-    In a terminal it asks y/N. In a headless host it shows a native macOS dialog, so an agent
-    cannot silently record an instruction; the human must click Allow.
+    Always the native macOS dialog, never stdin: any agent can hand a command a pseudo-TTY
+    (`echo y | script -qc "relay instruct ..." /dev/null`) and answer a y/N prompt, which would
+    let it record an instruction as the human (review #2 N1, path B). If macOS cannot show the
+    dialog, the instruction is refused.
     """
     if "PYTEST_CURRENT_TEST" in os.environ:
         return False  # tests must never open a macOS dialog
-    if sys.stdin.isatty():
-        try:
-            return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
-        except EOFError:
-            return False
     if sys.platform != "darwin":
         return False
     script = (
@@ -197,16 +194,21 @@ def _accept_locked(ctx: Context, answer: str, code: str, by: str) -> dict:
     pending = state.get("pending_decision")
     if not isinstance(pending, dict):
         raise StateError("there is no pending decision to answer")
-    expected = str(pending.get("code_hash") or "")
+    decision_id = str(pending.get("id") or "")
+    if not decision_id:
+        raise StateError("the pending decision has no id; re-ask it with `relay resume`")
+    # The expected hash lives in the external trust store, never in the project (N1).
+    expected = ctx.trust.code_hash(decision_id)
     if not expected:
-        raise StateError("this pending decision has no one-time code; re-ask it with `relay resume`")
+        raise StateError(
+            "this pending decision has no external one-time code; re-ask it with `relay resume`"
+        )
     if not code or not hmac.compare_digest(hash_code(code), expected):
         raise StateError("invalid one-time code")
     answer = _one_line(answer, 2000)
     if not answer:
         raise StateError("the answer is empty")
 
-    decision_id = str(pending["id"])
     event = ctx.journal.append(
         "decision.answered",
         actor=by,
@@ -228,6 +230,7 @@ def _accept_locked(ctx: Context, answer: str, code: str, by: str) -> dict:
         with open(ctx.paths.decisions, "a", encoding="utf-8") as fh:
             fh.write("\n".join(entry))
             fh.flush()
+    ctx.trust.clear_code(decision_id)
     atomic_write_text(ctx.paths.answers_dir / f"{decision_id}.txt", answer + "\n")
     try:
         ctx.paths.pending_decision.unlink()

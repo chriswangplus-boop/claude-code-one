@@ -277,3 +277,53 @@ def test_blocking_issue_ids_are_validated(tmp_path):
         expected_file=".relay/REVIEW.md", round_started_wall=time.time() - 1,
     )
     assert any("more than 10" in issue for issue in issues)
+
+
+# --- N2: Relay's git commands must never run agent-planted code --------------
+
+def _executable(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body + "\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_git_commit_never_runs_a_planted_pre_commit_hook(tmp_path):
+    git_init(tmp_path)
+    write(tmp_path, "a.txt", "one")
+    assert git_commit(tmp_path, "base")
+    marker = tmp_path / "hook-ran"
+    _executable(tmp_path / ".git/hooks/pre-commit", f"touch {marker}")
+    write(tmp_path, "a.txt", "two")
+
+    commit = git_commit(tmp_path, "with a planted hook")
+
+    assert commit
+    assert not marker.exists(), "the pre-commit hook ran"
+
+
+def test_git_status_never_runs_a_planted_fsmonitor(tmp_path):
+    git_init(tmp_path)
+    write(tmp_path, "a.txt", "one")
+    assert git_commit(tmp_path, "base")
+    marker = tmp_path / "fsmonitor-ran"
+    script = _executable(tmp_path / "fsm.sh", f"touch {marker}\necho")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "core.fsmonitor", str(script)],
+        check=True, capture_output=True,
+    )
+
+    git_snapshot(tmp_path)
+
+    assert not marker.exists(), "core.fsmonitor ran"
+
+
+def test_git_control_snapshot_sees_hooks_and_config(tmp_path):
+    git_init(tmp_path)
+    _executable(tmp_path / ".git/hooks/post-commit", "true")
+    before = integrity.git_control_snapshot(tmp_path)
+    assert ".git/hooks/post-commit" in before
+    assert ".git/config" in before
+
+    _executable(tmp_path / ".git/hooks/pre-commit", "true")
+    after = integrity.git_control_snapshot(tmp_path)
+    assert integrity.git_control_changes(before, after) == [".git/hooks/pre-commit"]

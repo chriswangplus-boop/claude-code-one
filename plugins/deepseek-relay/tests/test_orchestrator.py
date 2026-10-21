@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 from collections import deque
 from pathlib import Path
@@ -52,6 +53,8 @@ class ScriptedApps:
         self.stale_once = False
         self.control_once = False
         self.crash_review_once = False
+        self.hook_once = False
+        self.coder_reads: list[list[str]] = []
         self.claude = FakeAppDriver("claude", project, on_ring=self._claude_ring)
         self.coder = FakeAppDriver("coder", project, on_ring=self._coder_ring)
 
@@ -111,6 +114,12 @@ class ScriptedApps:
             return
         if "coder" in self.silent:
             return
+        import re as _re
+        named = sorted(set(_re.findall(r"\.relay/[A-Za-z_]+\.md", pointer)))
+        self.coder_reads.append(named)
+        seen_review = ""
+        if ".relay/REVIEW.md" in named and (self.project / ".relay/REVIEW.md").exists():
+            seen_review = (self.project / ".relay/REVIEW.md").read_text()
         if self.stale_once:
             write_sentinel(self.project, role, 1, ".relay/CODER_REPORT.md", context_pct=50)
             return
@@ -126,6 +135,12 @@ class ScriptedApps:
         if self.control_once:
             self.control_once = False
             self._write(".relay/monitor/CORRECTION.json", '{"action":"replan","reason":"agent"}')
+        if self.hook_once:
+            self.hook_once = False
+            hook = self.project / ".git/hooks/pre-commit"
+            hook.parent.mkdir(parents=True, exist_ok=True)
+            hook.write_text("#!/bin/sh\ntouch \"$(dirname \"$0\")/../../../hook-ran\"\n")
+            hook.chmod(0o755)
         if self.decision:
             decision, self.decision = self.decision, None
             self._write(".relay/CODER_REPORT.md", f"round {round_no} needs a decision")
@@ -136,7 +151,7 @@ class ScriptedApps:
             )
             return
         self._write("src/app.py", f"VERSION = {round_no}\n")
-        self._write(".relay/CODER_REPORT.md", f"coder report {round_no}")
+        self._write(".relay/CODER_REPORT.md", f"coder report {round_no}\n{seen_review}")
         write_sentinel(self.project, role, round_no, ".relay/CODER_REPORT.md", context_pct=self.coder_ctx)
         if self.crash_once:
             self.crash_once = False
@@ -177,10 +192,11 @@ def test_two_milestones_to_done_offline(ctx):
     assert apps.coder.new_session_calls == 1          # one clean coder chat at first use
     assert apps.claude.new_session_calls == 4         # planner/reviewer switch on each re-entry
     assert len(ctx.journal.of_type("session.open")) == 5
-    assert len(git_log(ctx.cfg.project_dir)) == 12  # init + 8 turns + 3 role-switch checkpoints
+    # init + 8 turns + 2 role-switch checkpoints (the strategist chat is never checkpointed).
+    assert len(git_log(ctx.cfg.project_dir)) == 11
     checkpoints = ctx.journal.of_type("session.checkpoint")
-    assert len(checkpoints) == 3
-    assert {item["detail"]["role"] for item in checkpoints} == {"planner", "reviewer", "strategist"}
+    assert len(checkpoints) == 2
+    assert {item["detail"]["role"] for item in checkpoints} == {"planner", "reviewer"}
     ok, errors = ctx.journal.verify()
     assert ok, errors
     pointers = apps.claude.rings + apps.coder.rings
@@ -702,3 +718,172 @@ def test_replans_reset_on_milestone_done(ctx):
     assert state["milestone"] == 2
     assert state["counters"]["replans"] == 0
     assert state["counters"]["stalls_in_milestone"] == 0
+
+
+# --- N2: git hooks planted before or during a turn never run -----------------
+
+def test_planted_hook_does_not_run_on_a_turn_commit(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    marker = ctx.cfg.project_dir / "hook-ran"
+    hook = ctx.cfg.project_dir / ".git/hooks/pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\ntouch \"$(dirname \"$0\")/../../../hook-ran\"\n")
+    hook.chmod(0o755)
+
+    orch.run(max_steps=2)
+
+    assert ctx.journal.of_type("git.commit")
+    assert not marker.exists(), "Relay's commit ran the planted hook"
+
+
+def test_hook_planted_during_a_turn_is_a_violation_and_does_not_run(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    apps.hook_once = True
+    state = orch.run(max_steps=4)
+
+    assert state["phase"] == "PAUSED"
+    violation = ctx.journal.latest("integrity.violation")
+    assert violation["detail"]["kind"] == "git_control"
+    assert any(path.endswith("pre-commit") for path in violation["detail"]["paths"])
+    assert not (ctx.cfg.project_dir / "hook-ran").exists()
+
+
+# --- N3: after CHANGES_REQUESTED the coder is pointed at REVIEW.md -----------
+
+def test_coder_is_pointed_at_the_review_after_changes_requested(ctx):
+    orch, apps, notifier, _ = build(ctx, verdicts=["CHANGES_REQUESTED", "PROJECT_DONE"])
+    state = orch.run(max_steps=30)
+    assert state["phase"] == "DONE"
+
+    rings = [
+        pointer for pointer in apps.coder.rings
+        if "role=coder" in pointer
+        and not pointer.startswith(("RELAY seed", "RELAY nudge", "RELAY checkpoint"))
+    ]
+    assert len(rings) >= 2
+    assert ".relay/REVIEW.md" not in rings[0], "the first code turn has no review yet"
+    assert ".relay/REVIEW.md" in rings[1], "the coder must be pointed at the review"
+    assert len(rings[1]) < 500
+
+    # The coder only sees what the pointer names, and its report now carries the feedback.
+    assert ".relay/REVIEW.md" not in apps.coder_reads[0]
+    assert ".relay/REVIEW.md" in apps.coder_reads[1]
+    report = (ctx.cfg.project_dir / ".relay/CODER_REPORT.md").read_text()
+    assert "review" in report.lower() or "CHANGES_REQUESTED" in report
+
+
+# --- N1: human-only actions need proof from outside the project --------------
+
+def _decision_build(ctx, **kw):
+    decision = {
+        "question": "Store tasks as JSON or SQLite?",
+        "options": [
+            {"label": "JSON", "consequence": "zero dependencies"},
+            {"label": "SQLite", "consequence": "better concurrency"},
+        ],
+    }
+    return build(ctx, verdicts=["CHANGES_REQUESTED", "PROJECT_DONE"], decision=decision, **kw)
+
+
+def test_rewriting_state_json_cannot_answer_a_decision(ctx):
+    from relay.decisions import accept_decision, hash_code
+    from relay.errors import StateError
+
+    orch, apps, notifier, _ = _decision_build(ctx)
+    state = orch.run(max_steps=10, wait_human=False)
+    assert state["phase"] == "WAIT_HUMAN"
+    real_code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["desktop_body"]).group(1)
+    assert "code_hash" not in ctx.paths.state.read_text()
+
+    fake_code = "agentchosen"
+    ctx.store.mutate(
+        lambda current: current["pending_decision"].__setitem__("code_hash", hash_code(fake_code))
+    )
+    pending = ctx.paths.pending_decision.read_text().rstrip()
+    ctx.paths.pending_decision.write_text(pending + f" {fake_code} A, use JSON\n")
+
+    with pytest.raises(StateError, match="invalid one-time code"):
+        accept_decision(ctx, "A, use JSON", fake_code)
+    assert ctx.journal.of_type("decision.answered") == []
+    assert ctx.store.load()["phase"] == "WAIT_HUMAN"
+
+    # The real one-time code, held only outside the project, still works.
+    result = accept_decision(ctx, "A, use JSON", real_code)
+    assert result["phase"] == "CODE"
+    assert len(ctx.journal.of_type("decision.answered")) == 1
+
+
+def test_state_edits_while_waiting_for_a_decision_pause(ctx, monkeypatch):
+    import relay.orchestrator as orchestrator_module
+
+    orch, apps, notifier, _ = _decision_build(ctx)
+    state = orch.run(max_steps=10, wait_human=False)
+    assert state["phase"] == "WAIT_HUMAN"
+
+    calls = {"n": 0}
+
+    def tampering(paths):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            ctx.store.mutate(lambda current: current["pending_decision"].__setitem__("question", "pwned"))
+        return None
+
+    monkeypatch.setattr(orchestrator_module, "local_answer", tampering)
+    orch.wait_for_decision()
+
+    state = ctx.store.load()
+    assert state["phase"] == "PAUSED"
+    assert "tampering" in state["paused_reason"]
+    assert ctx.journal.of_type("decision.tamper")
+
+
+def test_waiting_for_a_decision_accepts_the_real_code(ctx, monkeypatch):
+    import relay.orchestrator as orchestrator_module
+
+    orch, apps, notifier, _ = _decision_build(ctx)
+    state = orch.run(max_steps=10, wait_human=False)
+    assert state["phase"] == "WAIT_HUMAN"
+    real_code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["desktop_body"]).group(1)
+
+    monkeypatch.setattr(orchestrator_module, "local_answer", lambda paths: (real_code, "JSON"))
+    orch.wait_for_decision()
+
+    assert ctx.store.load()["phase"] == "CODE"
+    assert len(ctx.journal.of_type("decision.answered")) == 1
+    assert ctx.journal.of_type("decision.tamper") == []
+
+
+# --- P3 N9/N10 ---------------------------------------------------------------
+
+def test_opus_count_and_pending_are_saved_together(ctx):
+    orch, apps, notifier, _ = build(ctx, verdicts=["PROJECT_DONE"])
+    ctx.store.mutate(lambda state: state.update({"phase": "CODE", "issue_streaks": {"hard-bug": 4}}))
+    original_append = ctx.journal.append
+
+    def fail_on_escalation(event_type, **kwargs):
+        if event_type == "model.escalated":
+            raise RuntimeError("simulated crash after the state save")
+        return original_append(event_type, **kwargs)
+
+    ctx.journal.append = fail_on_escalation
+    with pytest.raises(RuntimeError, match="after the state save"):
+        orch.run(max_steps=2)
+    state = ctx.store.load()
+    assert state["pending"]["escalated"] is True
+    assert state["opus"]["day"] == 1
+
+    ctx.journal.append = original_append
+    orch2 = Orchestrator(ctx, apps.drivers(), brain=StubBrain(), notifier=notifier)
+    state = orch2.resume(max_steps=4, wait_human=False)
+    assert ctx.store.load()["opus"]["day"] == 1, "a resumed turn must not be counted twice"
+
+
+def test_first_turn_does_not_overwrite_user_edits(ctx):
+    orch, apps, notifier, _ = build(ctx, verdicts=["PROJECT_DONE"])
+    (ctx.cfg.project_dir / "user-notes.txt").write_text("do not touch")
+    state = orch.run(max_steps=1, wait_human=False)
+
+    assert state["phase"] == "WAIT_HUMAN"
+    assert "uncommitted" in ctx.paths.pending_decision.read_text().lower()
+    commits = ctx.journal.of_type("git.commit")
+    assert not any("user-notes" in str(commit.get("detail", {}).get("changed", "")) for commit in commits)

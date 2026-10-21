@@ -36,7 +36,7 @@ CLAUDE_OWNED = {"PLAN.md", "HANDOFF.md", "REVIEW.md", "FIX_PLAN.md", "STRATEGY.m
 CODER_OWNED = {"CODER_REPORT.md", "CODER_DONE.json", "CHECKPOINT_coder.md"}
 
 IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", ".tox", "dist", "build", ".DS_Store"}
-IGNORED_PREFIXES = (".relay/journal/",)
+IGNORED_PREFIXES = (".relay/journal/", ".relay/archive/")
 IGNORED_FILES = {
     ".relay/.lock", ".relay/.run.pid", ".relay/.run.lock", ".relay/HEARTBEAT.json",
     ".relay/relay.log", ".relay/monitor/HEARTBEAT.json", ".relay/monitor/.monitor.lock",
@@ -309,10 +309,31 @@ def validate_sentinel(
 
 # --- git ------------------------------------------------------------------
 
+# An agent can write .git/config and .git/hooks; `.git` is never snapshotted as a turn file.
+# Every git command Relay runs therefore ignores hooks, fsmonitor, pager and external diff, and
+# never prompts for credentials or reads system config (review #2, N2).
+GIT_SAFE_ARGS = [
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.pager=cat",
+    "-c", "commit.gpgsign=false",
+    "-c", "tag.gpgsign=false",
+]
+GIT_SAFE_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_EXTERNAL_DIFF": "",
+    "GIT_PAGER": "cat",
+}
+
+GIT_CONTROL_PATHS = (".git/config", ".git/info/attributes", ".gitmodules")
+
+
 def _git(root: Path, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    env = {**os.environ, **GIT_SAFE_ENV}
     return subprocess.run(
-        ["git", "-C", str(root), *args],
-        capture_output=True, text=True, timeout=timeout, check=False,
+        ["git", "-C", str(root), *GIT_SAFE_ARGS, *args],
+        capture_output=True, text=True, timeout=timeout, check=False, env=env,
     )
 
 
@@ -331,6 +352,34 @@ def git_init(root: str | Path) -> bool:
     if result.returncode != 0:
         raise IntegrityError(f"git init failed: {result.stderr.strip()}")
     return True
+
+
+def git_control_snapshot(root: str | Path) -> dict[str, str]:
+    """Hashes of the files that can make git run an agent's command.
+
+    Compared before and after a turn; any change is an ownership violation. Hooks are also
+    neutralised by `GIT_SAFE_ARGS`, so a planted one never runs even before it is noticed.
+    """
+    root = Path(root)
+    out: dict[str, str] = {}
+    for rel in GIT_CONTROL_PATHS:
+        path = root / rel
+        if path.is_file():
+            try:
+                out[rel] = sha256_file(path)
+            except OSError:
+                continue
+    hooks = root / ".git" / "hooks"
+    if hooks.is_dir():
+        for path in sorted(hooks.iterdir()):
+            if path.is_file():
+                out[path.relative_to(root).as_posix()] = sha256_file(path)
+    return out
+
+
+def git_control_changes(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    keys = set(before) | set(after)
+    return sorted(key for key in keys if before.get(key) != after.get(key))
 
 
 def git_snapshot(root: str | Path) -> list[str]:
@@ -372,17 +421,19 @@ def git_commit(root: str | Path, message: str, add_all: bool = True) -> str | No
         added = _git(root, ["add", "-A"])
         if added.returncode != 0:
             raise IntegrityError(f"git add failed: {added.stderr.strip()}")
-    staged = _git(root, ["diff", "--cached", "--quiet"])
+    staged = _git(root, ["diff", "--cached", "--quiet", "--no-ext-diff"])
     if staged.returncode == 0:
         return None
     staged_files = [
-        line for line in _git(root, ["diff", "--cached", "--name-only"]).stdout.splitlines() if line.strip()
+        line
+        for line in _git(root, ["diff", "--cached", "--name-only", "--no-ext-diff"]).stdout.splitlines()
+        if line.strip()
     ]
     hits = secret_scan(root, staged_files)
     if hits:
         summary = ", ".join(f"{h['path']}:{h['line']} ({h['rule']})" for h in hits[:5])
         raise SecretDetected(f"secret scan blocked the commit: {summary}")
-    result = _git(root, [*_identity_args(root), "commit", "-m", message])
+    result = _git(root, [*_identity_args(root), "commit", "--no-verify", "-m", message])
     if result.returncode != 0:
         raise IntegrityError(f"git commit failed: {result.stderr.strip()}")
     head = _git(root, ["rev-parse", "HEAD"]).stdout.strip()

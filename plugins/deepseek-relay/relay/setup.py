@@ -28,6 +28,7 @@ GITIGNORE_LINES = [
     ".relay/journal/",
     ".relay/monitor/",
     ".relay/answers/",
+    ".relay/archive/",
     ".relay/calibration/",
     ".relay/CALIBRATION_*.json",
     "# Secrets",

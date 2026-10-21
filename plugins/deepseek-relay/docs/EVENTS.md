@@ -60,6 +60,7 @@ the decoder. Unknown `detail` fields are ignored.
 | `model.requested` | no | `source` |
 | `model.declined` | no | `role`, `issue_ids` |
 | `fix.plan_requested` | no | `issue_ids`, `streak` |
+| `fix.plan_archived` | no | `reason`, `archived`, `sha256` |
 | `limit.cap_reached` | no | `kind`, `current`, `limit` |
 | `limit.decision_applied` | no | `action`, `cap` |
 | `blocked.cleared` | no | `paths` |
@@ -69,6 +70,7 @@ the decoder. Unknown `detail` fields are ignored.
 | `decision.reminder` | no | `id` |
 | `decision.timeout` | no | `id` |
 | `decision.rejected` | no | `id`, `reason` |
+| `decision.tamper` | yes | `id`, `reason` |
 | `route.judgment` | no | `route`, `reason`, `drift_flags`, `call_id`, `suggest_escalation` |
 | `route.decided` | yes | `base`, `target`, `brain`, `stall`, `summary` |
 | `route.after_decision` | no | `note` |

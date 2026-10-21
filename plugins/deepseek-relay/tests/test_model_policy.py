@@ -219,7 +219,11 @@ def test_streak_two_writes_fix_plan_and_next_code_pointer_names_it(ctx):
     state = orch.run(max_steps=40)
     assert state["phase"] == "DONE"
 
-    assert (ctx.cfg.project_dir / ".relay/FIX_PLAN.md").exists()
+    # N4: once the issue stops blocking, the plan is archived instead of followed forever.
+    archived = ctx.journal.of_type("fix.plan_archived")
+    assert archived and archived[0]["detail"]["reason"] == "issues resolved"
+    assert not (ctx.cfg.project_dir / ".relay/FIX_PLAN.md").exists()
+    assert (ctx.cfg.project_dir / archived[0]["detail"]["archived"]).exists()
     requested = ctx.journal.of_type("fix.plan_requested")
     assert requested, "the harness must journal the fix-plan request"
     assert requested[0]["detail"]["issue_ids"] == [issue]
@@ -510,3 +514,80 @@ def test_a_repeated_streak_without_growth_may_use_the_fixer_again(ctx):
     choice = choose_turn(state, "CODE", ctx.cfg, today="2026-10-20")
     assert choice.role is None
     assert choice.needs_human["kind"] == "fixer_retry"
+
+
+# --- N4: a stale FIX_PLAN is archived and no longer named ---------------------
+
+def test_resolved_fix_plan_is_archived_before_the_next_code_turn(ctx):
+    issue = "stale-plan-issue"
+    apps = PolicyApps(
+        ctx.cfg.project_dir,
+        verdicts=["CHANGES_REQUESTED", "CHANGES_REQUESTED", "CHANGES_REQUESTED", "PROJECT_DONE"],
+        issues=[[issue], [issue], [], []],
+    )
+    orch, notifier, _ = build(ctx, apps)
+    state = orch.run(max_steps=50)
+    assert state["phase"] == "DONE"
+
+    archived = ctx.journal.of_type("fix.plan_archived")
+    assert archived, "the resolved plan must be archived"
+    assert archived[0]["detail"]["reason"] == "issues resolved"
+    assert not (ctx.cfg.project_dir / ".relay/FIX_PLAN.md").exists()
+    assert state["fix_plan_issues"] == []
+
+    code_rings = [
+        pointer for pointer in apps.coder.rings
+        if "role=coder" in pointer and not pointer.startswith(("RELAY seed", "RELAY nudge"))
+    ]
+    assert any(".relay/FIX_PLAN.md" in pointer for pointer in code_rings[:-1])
+    assert ".relay/FIX_PLAN.md" not in code_rings[-1], "a resolved plan must not be followed"
+
+
+# --- N5: no hidden Opus checkpoint turns --------------------------------------
+
+def test_no_uncounted_opus_turn_after_the_fixer(ctx):
+    issue = "hard-bug"
+    apps = PolicyApps(
+        ctx.cfg.project_dir,
+        verdicts=["CHANGES_REQUESTED"] * 4 + ["PROJECT_DONE"],
+        issues=[[issue]] * 4 + [[]],
+    )
+    orch, notifier, _ = build(ctx, apps)
+    state = orch.run(max_steps=60)
+    assert state["phase"] == "DONE"
+
+    opus_turns = [
+        event for event in ctx.journal.of_type("turn.start")
+        if event["detail"].get("model") == "Opus 5.5"
+    ]
+    escalated = ctx.journal.of_type("model.escalated")
+    assert len(opus_turns) == len(escalated), (opus_turns, escalated)
+    assert not any(
+        pointer.startswith("RELAY checkpoint") and "role=fixer" in pointer
+        for pointer in apps.claude.rings
+    )
+    assert not any(
+        event["detail"].get("role") in ("fixer", "strategist")
+        for event in ctx.journal.of_type("session.checkpoint")
+    )
+
+
+# --- N8: the reviewer is shown the previous issue ids ------------------------
+
+def test_reviewer_pointer_lists_previous_issue_ids(ctx):
+    issue = "auth-token-expiry"
+    apps = PolicyApps(
+        ctx.cfg.project_dir,
+        verdicts=["CHANGES_REQUESTED", "CHANGES_REQUESTED", "PROJECT_DONE"],
+        issues=[[issue], [issue], []],
+    )
+    orch, notifier, _ = build(ctx, apps)
+    orch.run(max_steps=40)
+
+    reviewer_rings = [
+        pointer for pointer in apps.claude.rings
+        if "role=reviewer" in pointer and not pointer.startswith(("RELAY seed", "RELAY nudge"))
+    ]
+    assert len(reviewer_rings) >= 2
+    assert f"Previous ids: {issue}" in reviewer_rings[1]
+    assert all(len(pointer) < 500 for pointer in reviewer_rings)

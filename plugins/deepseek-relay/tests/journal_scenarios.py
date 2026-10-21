@@ -156,6 +156,10 @@ def _append_rare(ctx, events: list[dict]) -> None:
     journal.append("decision.reminder", detail={"id": "D-001"})
     journal.append("decision.timeout", detail={"id": "D-001"}, result="still waiting")
     journal.append("decision.rejected", detail={"id": "D-001", "reason": "invalid one-time code"}, result="ignored")
+    journal.append(
+        "decision.tamper", detail={"id": "D-001", "reason": "STATE.json changed while waiting"},
+        result="blocked",
+    )
     journal.append("route.after_decision", round_no=4, detail={"note": "routing judgment re-raised a question answered this round; using deterministic route"})
     journal.append("stall.detected", round_no=4, detail={"reason": "three change requests with no source changes", "replans": 1})
     journal.append("gui.focus", detail={"app": "claude", "title": "Claude", "rect": [0, 0, 1200, 800]})
@@ -196,7 +200,9 @@ def build_journal(root: str | Path) -> list[dict]:
     """Run the scenario in `root` and return every journal event it produced."""
     root = Path(root)
     clock = ManualClock()
-    ctx = open_project(root, env={}, clock=clock)
+    ctx = open_project(
+        root, env={"RELAY_TRUST_DIR": str(Path(root).parent / "relay-trust")}, clock=clock
+    )
     init_project(ctx.cfg, ctx.paths, ctx.store, ctx.journal, goal="Fixture project")
     ctx.cfg.set("claude_app.max_rounds_per_session", 1)
     ctx.cfg.set("zcode_app.max_rounds_per_session", 1)

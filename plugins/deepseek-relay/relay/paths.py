@@ -153,6 +153,10 @@ class Paths:
     def answers_dir(self) -> Path:
         return self.relay_dir / "answers"
 
+    @property
+    def archive_dir(self) -> Path:
+        return self.relay_dir / "archive"
+
     def calibration(self, app: str) -> Path:
         return self.calibration_dir / f"{app}.json"
 
@@ -163,5 +167,5 @@ class Paths:
         """Directories Relay may create."""
         return [
             self.relay_dir, self.journal_dir, self.calls_dir, self.screens_dir,
-            self.monitor_dir, self.calibration_dir, self.answers_dir,
+            self.monitor_dir, self.calibration_dir, self.answers_dir, self.archive_dir,
         ]

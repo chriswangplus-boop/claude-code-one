@@ -11,6 +11,7 @@ from .config import Config, load_config
 from .journal import Journal
 from .paths import Paths
 from .state import FileLock, StateStore
+from .trust import TrustStore
 
 
 @dataclass
@@ -21,6 +22,7 @@ class Context:
     clock: RealClock
     store: StateStore
     journal: Journal
+    trust: TrustStore
 
 
 def open_project(
@@ -36,5 +38,8 @@ def open_project(
     clock = clock or RealClock()
     lock = FileLock(paths.lock, timeout=lock_timeout)
     store = StateStore(paths, clock=clock, lock=lock)
-    journal = Journal(paths, lock=lock, clock=clock)
-    return Context(cfg=cfg, paths=paths, lock=lock, clock=clock, store=store, journal=journal)
+    trust = TrustStore(cfg.project_dir, env=env)
+    journal = Journal(paths, lock=lock, clock=clock, trust=trust)
+    return Context(
+        cfg=cfg, paths=paths, lock=lock, clock=clock, store=store, journal=journal, trust=trust
+    )

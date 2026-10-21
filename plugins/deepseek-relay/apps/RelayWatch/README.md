@@ -10,9 +10,12 @@ It never writes in the project, never answers a decision, and never touches the 
 - **Read-only:** all file access goes through one `RelayFolder` type that has no write APIs. The
   app shows the command to run for a decision, never the one-time code, so it cannot become a
   decision channel.
-- **Low energy:** `FSEventStream` with 3 s latency, incremental byte-offset reads, a
-  meaningful-event filter, no polling loop, no animation, no network. A 30 s heartbeat timer runs
-  only while the window or menu is open.
+- **Low energy:** `FSEventStream` with 3 s latency, watching only `.relay/journal` (day files) and
+  `.relay/STATE.json` / `.relay/PENDING_DECISION.md` — never the heartbeats that Relay rewrites
+  every 10-25 s. Incremental byte-offset reads, a meaningful-event filter, no polling loop, no
+  animation, no network. A 30 s heartbeat timer runs only while the window or menu is open, and a
+  single one-shot timer fires at "last heartbeat + 5 min" so a dead Relay turns the glyph red
+  without waiting for a new journal event.
 
 ## Requirements
 
@@ -76,7 +79,10 @@ The window shows:
 
 Menu-bar glyphs: `circle.fill` green (running, fresh heartbeat), `pause.circle` (paused),
 `questionmark.circle.fill` orange (waiting for you), `exclamationmark.octagon.fill` red (HALT,
-chain failure or error), `checkmark.circle` (done). The round number sits next to the glyph.
+chain failure, error, or an active phase whose heartbeat is older than 5 minutes),
+`checkmark.circle` (done). The round number sits next to the glyph. If Relay and the monitor both
+die, the one-shot staleness timer recomputes the glyph and it turns red even though no new event
+arrives.
 
 The app never activates itself, never opens a window on its own, and sends no notifications.
 Relay's window-only screenshots means the viewer can never appear in a crop sent to DeepSeek.
@@ -100,17 +106,22 @@ swift test
 5. a full read session leaves every file size and modification time unchanged (all access goes
    through `RelayFolder`, which has no write APIs).
 
+Plus N7 tests: an active phase with a 10-minute-old heartbeat yields the red glyph with no new
+event, and heartbeat/screenshot/call-record paths never pass the wake filter.
+
 `tools/make_event_fixtures.py` (in the plugin root) regenerates the fixture from a real
 fake-driver run plus real monitor/decision/guard paths.
 
 ## Energy check (C9 6)
 
-Method (the numbers below were taken with the menu-bar item idle and the window closed):
+Method (menu-bar item only, window closed):
 
-1. Build with `swift build -c release`.
-2. Run `RELAY_WATCH_PROJECT=<fixture project> <binary>` and leave it for 30 minutes without
-   opening the window.
-3. Read CPU time with `ps -o etime,time,%cpu -p <pid>` and, in Activity Monitor → Energy,
+1. Build with `swift build`.
+2. Idle sample: run `RELAY_WATCH_PROJECT=<fixture project> <binary>` for 30 minutes.
+3. Live sample: same, but a shell rewrote `.relay/HEARTBEAT.json` and
+   `.relay/monitor/HEARTBEAT.json` every 10 s (the cadence of a real run) for 10 minutes. The
+   watcher must not react to them.
+4. Read CPU time with `ps -o etime,time,%cpu -p <pid>` and, in Activity Monitor → Energy,
    "Energy Impact" and "Idle Wake Ups".
 
 Observed on 2026-10-21, macOS 27.2 arm64, Apple Silicon, debug build (SwiftPM `swift build`),
@@ -126,9 +137,22 @@ menu-bar item only, window never opened, started 15:20:07 JST:
 | Activity Monitor "Energy Impact" | not readable headlessly — see limitation |
 | Activity Monitor "Idle Wake Ups" | not readable headlessly — see limitation |
 
-The app read a fixture project (two day files, 297 events) and wrote nothing: the fixture folder
-still contains only the files created before launch. A release build should be at or below these
-numbers; re-run the 30-minute test with Activity Monitor on the Mac that will run it.
+Live-run sample (new watcher, heartbeats rewritten every 10 s, 10 minutes):
+
+| Measurement | Value |
+|---|---|
+| Wall time | 10 min 12 s |
+| CPU time (`TIME`) | 0.36 s total (about 0.14 s of that is launch) |
+| Average CPU % | ≈ 0.06 % (0.36 s / 612 s) |
+| Heartbeat writes during the window | 122 (two files every 10 s) |
+| Resident memory | 86 MB |
+
+The watcher never reacted to the heartbeat writes; the CPU time rose by about 0.22 s over the
+nine minutes after launch. A release build should be at or below these numbers.
+
+The app read a fixture project and wrote nothing: the fixture folder still contains only the files
+created before launch. A release build should be at or below these numbers; re-run the test with
+Activity Monitor on the Mac that will run it.
 
 The FSEvents stream with `latency = 3.0` wakes the app only when Relay writes; the 30 s timer is
 invalidated when the UI closes, so an idle app should have no timer wake-ups at all. Re-run the

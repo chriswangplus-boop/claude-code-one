@@ -16,7 +16,7 @@ def test_popup_allow_list_rules():
         r"^allow .* to read (?:a )?file(?: .*)?\??$",
         r"^allow .* to edit (?:a )?file in (?:the )?project(?: .*)?\??$",
         r"^run (?:the )?tests?(?: .*)?\??$",
-        r"^allow git (status|diff|add|commit)(?: .*)?\??$",
+        r"^allow git (status|diff)(?: .*)?\??$",
     ]
     assert decide_popup(Popup("Allow Claude to read file src/app.py?", ["Allow", "Deny"]), allow) == "approve"
     assert decide_popup(Popup("Run tests in the project?", ["Run", "Cancel"]), allow) == "approve"
@@ -53,9 +53,13 @@ class FakeBackend:
         self.rect = Rect(100, 50, 800, 600)
         self.capture_same = False
         self.capture_seq = 0
+        self.dialog: tuple[str, list[str]] | None = None
 
     def window(self, process, title):
         return {"title": "Claude", "rect": self.rect}
+
+    def read_dialog(self, process, title=""):
+        return self.dialog
 
     def focus(self, process, title):
         return {"title": "Claude", "rect": self.rect}
@@ -158,6 +162,7 @@ def test_popup_clicks_by_label_and_ignores_vision_points(ctx):
         "present": True, "text": "Allow Claude to read file src/app.py?", "buttons": ["Allow", "Deny"],
         "button_points": {"Allow": [999, 999]}, "confidence": 0.9,
     })
+    backend.dialog = ("Allow Claude to read file src/app.py?", ["Allow", "Deny"])
     popup = driver.read_popup()
     assert popup is not None and popup.buttons == ["Allow", "Deny"]
     assert popup.button_points == {}
@@ -238,3 +243,122 @@ def test_window_capture_uses_window_id_not_screen_region(tmp_path, monkeypatch):
     assert "-l" in calls[0]
     assert "4242" in calls[0]
     assert "-R" not in calls[0]
+
+
+# --- N6: dialog text from Accessibility, and argument-level approval checks ----
+
+def test_popup_approval_rejects_risky_arguments():
+    risky = [
+        "Allow Bash: git diff --output=/Users/me/.zshrc",
+        "Allow Bash: git add .relay/STATE.json",
+        "Allow Bash: git commit --no-verify -m x",
+        "Allow Bash: python3 -m pytest -q -p evil_plugin",
+        "Allow Bash: pytest --rootdir=/tmp/evil",
+        "Allow Bash: git diff /etc/passwd",
+        "Allow Bash: git diff --no-index /etc/passwd",
+    ]
+    for text in risky:
+        assert decide_popup(Popup(text, ["Allow", "Deny"]), []) == "human", text
+    assert decide_popup(Popup("Allow Bash: git diff", ["Allow", "Deny"]), []) == "approve"
+    assert decide_popup(Popup("Allow Bash: git status -sb", ["Allow", "Deny"]), []) == "approve"
+    assert decide_popup(Popup("Run pytest -q", ["Run", "Cancel"]), []) == "approve"
+
+
+class DialogBackend:
+    def __init__(self, dialog):
+        self.dialog = dialog
+        self.captures = 0
+
+    def read_dialog(self, process, title=""):
+        if isinstance(self.dialog, Exception):
+            raise self.dialog
+        return self.dialog
+
+    def capture(self, *args, **kwargs):
+        self.captures += 1
+        raise AssertionError("popup text must not be read from a screenshot")
+
+
+def _dialog_driver(ctx, backend):
+    calibration = Calibration(
+        app="claude", process_name="Claude", window_title_contains="Claude", input_point=(10.0, 10.0)
+    )
+
+    def vision(*args, **kwargs):
+        raise AssertionError("popup text must not come from vision")
+
+    return GuiAppDriver(ctx.cfg, ctx.journal, "claude", calibration, backend, vision=vision)
+
+
+def test_popup_text_and_buttons_come_from_accessibility(ctx):
+    backend = DialogBackend(("Allow Bash: git status", ["Allow", "Deny"]))
+    driver = _dialog_driver(ctx, backend)
+
+    popup = driver.read_popup()
+
+    assert popup is not None
+    assert popup.text == "Allow Bash: git status"
+    assert popup.buttons == ["Allow", "Deny"]
+    assert backend.captures == 0
+
+
+def test_unreadable_dialog_escalates_instead_of_approving(ctx):
+    from relay.errors import HumanRequired
+    from relay.gui.screen import ScreenError
+    from relay.orchestrator import Orchestrator
+    from relay.notify import FakeNotifier
+    from relay.setup import init_project
+
+    init_project(ctx.cfg, ctx.paths, ctx.store, ctx.journal, goal="popup")
+    apps = FakeAppDriver("claude", ctx.cfg.project_dir)
+    apps.popup = Popup("x", ["Allow"])
+    orch = Orchestrator(ctx, {"claude": apps, "coder": FakeAppDriver("coder", ctx.cfg.project_dir)},
+                        notifier=FakeNotifier())
+
+    def explode():
+        raise ScreenError("automation denied")
+
+    apps.read_popup = explode
+    with pytest.raises(HumanRequired, match="Accessibility"):
+        orch._screen_check(apps, "planner")
+    assert ctx.journal.of_type("popup.approved") == []
+
+
+# --- N11: the Automation permission is probed, not assumed -------------------
+
+@pytest.mark.skipif(__import__("sys").platform != "darwin", reason="macOS backend")
+def test_system_events_permission_is_probed(ctx, monkeypatch):
+    from relay.gui.screen import MacOSBackend
+
+    backend = MacOSBackend(ctx.cfg)
+
+    class Result:
+        def __init__(self, returncode: int, stderr: str = ""):
+            self.returncode = returncode
+            self.stderr = stderr
+            self.stdout = ""
+
+    monkeypatch.setattr(
+        backend, "_run",
+        lambda *args, **kwargs: Result(
+            1, "execution error: Not authorized to send Apple events to System Events. (-1743)"
+        ),
+    )
+    assert backend._system_events_ok() is False
+
+    monkeypatch.setattr(backend, "_run", lambda *args, **kwargs: Result(0))
+    assert backend._system_events_ok() is True
+
+
+@pytest.mark.skipif(__import__("sys").platform != "darwin", reason="macOS backend")
+def test_permissions_reports_automation_failure_separately(ctx, monkeypatch):
+    from relay.gui.screen import MacOSBackend
+
+    backend = MacOSBackend(ctx.cfg)
+    monkeypatch.setattr(backend, "_accessibility_ok", lambda: True)
+    monkeypatch.setattr(backend, "_screen_recording_ok", lambda: True)
+    monkeypatch.setattr(backend, "_system_events_ok", lambda: False)
+
+    permissions = backend.permissions()
+    assert permissions["accessibility"] is True
+    assert permissions["system_events"] is False

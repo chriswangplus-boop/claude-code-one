@@ -312,17 +312,12 @@ class GuiAppDriver(AppDriver):
             return None
 
     def read_popup(self) -> Popup | None:
-        try:
-            capture = self._capture(self.cal.popup_region, "popup")
-            result = self._vision(capture.path, "popup", None)
-        except (VisionUnavailable, BrainError):
+        """The dialog text and buttons come from Accessibility, never from vision (N6)."""
+        dialog = self.backend.read_dialog(self.cal.process_name, self.cal.window_title_contains)
+        if dialog is None:
             return None
-        if not result.get("present"):
-            return None
-        if float(result.get("confidence", 1.0)) < 0.6:
-            return Popup(text=str(result.get("text") or ""), buttons=[])
-        # Deliberately ignore any button_points from the model: clicks go by Accessibility label.
-        return Popup(text=str(result.get("text") or ""), buttons=list(result.get("buttons") or []))
+        text, buttons = dialog
+        return Popup(text=text, buttons=list(buttons))
 
     def click_popup(self, popup: Popup, button: str) -> None:
         if self.backend.idle_seconds() < int(self.cfg.get("user_idle_seconds", 30)):

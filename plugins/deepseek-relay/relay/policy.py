@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 
 from .gui.base import Popup
 
@@ -18,13 +19,40 @@ SHELL_META = re.compile(r"[;&|`$<>\n\\]")
 
 # Anchored commands. A substring match is never enough.
 SAFE_COMMANDS = [
-    re.compile(r"^git (?:status|diff|add|commit)(?: [^;&|`$<>\n\\]*)?$", re.IGNORECASE),
+    # `git add`/`git commit` are deliberately absent: only Relay commits.
+    re.compile(r"^git (?:status|diff)(?: [^;&|`$<>\n\\]*)?$", re.IGNORECASE),
     re.compile(r"^(?:pytest|python3? -m pytest)(?: [^;&|`$<>\n\\]*)?$", re.IGNORECASE),
 ]
+
 COMMAND_EXTRACTORS = [
     re.compile(r"(?:allow|approve|permit)\s+(?:bash|shell|terminal|command|to run)\s*:?\s*(.+)$", re.IGNORECASE),
     re.compile(r"(?:run|execute)\s+(?:the\s+)?(?:command\s+)?:?\s*(.+)$", re.IGNORECASE),
 ]
+
+# N6: a whole-command match is not enough; flags can write files or load code.
+FORBIDDEN_FLAGS = {
+    "--output", "-o", "--ext-diff", "-c", "--config", "--config-file", "--no-verify",
+    "-p", "--rootdir", "--upload-pack", "--receive-pack", "--exec-path", "--git-dir",
+    "--work-tree", "--no-index", "--basetemp", "--override-ini", "--plugin",
+}
+
+
+def command_arguments_are_safe(command: str) -> bool:
+    """Reject flags that write outside the project or load agent code, and absolute paths."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    for token in tokens[1:]:
+        lowered = token.lower()
+        flag = lowered.split("=", 1)[0]
+        if flag in FORBIDDEN_FLAGS or lowered in FORBIDDEN_FLAGS:
+            return False
+        if lowered.startswith(("-p", "-c", "-o")) and lowered not in ("-",):
+            return False
+        if token.startswith(("/", "~", "../")) or "/../" in token or token.startswith(".git/"):
+            return False
+    return True
 
 
 def _phrase(term: str, text: str) -> bool:
@@ -81,6 +109,8 @@ def decide_popup(
         if SHELL_META.search(command):
             return "human"
         patterns = [re.compile(str(item), re.IGNORECASE) for item in (allow_commands or [])]
+        if not command_arguments_are_safe(command):
+            return "human"
         if any(pattern.fullmatch(command) for pattern in patterns + SAFE_COMMANDS):
             return "approve"
         return "human"

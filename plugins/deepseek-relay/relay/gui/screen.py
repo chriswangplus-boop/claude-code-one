@@ -97,15 +97,24 @@ class MacOSBackend:
 
     # --- permissions ------------------------------------------------------
     def permissions(self) -> dict[str, Any]:
-        accessibility = self._accessibility_ok()
         return {
-            "accessibility": accessibility,
+            "accessibility": self._accessibility_ok(),
             "screen_recording": self._screen_recording_ok(),
-            # System Events automation uses the same TCC gate as Accessibility in practice.
-            "system_events": accessibility,
+            # N11: a real probe, not "same as Accessibility". Automation can be revoked alone.
+            "system_events": self._system_events_ok(),
         }
 
     def _accessibility_ok(self) -> bool:
+        # AXIsProcessTrusted is a silent check: it never shows the TCC prompt mid-run.
+        try:
+            function = self._lib.AXIsProcessTrusted
+            function.restype = ctypes.c_bool
+            function.argtypes = []
+            return bool(function())
+        except Exception:
+            return self._system_events_ok()
+
+    def _system_events_ok(self) -> bool:
         script = 'tell application "System Events" to get name of first process'
         try:
             result = self._run([OSASCRIPT, "-e", script], timeout=15)
@@ -114,7 +123,11 @@ class MacOSBackend:
         if result.returncode == 0:
             return True
         low = (result.stderr + result.stdout).lower()
-        return not ("assistive" in low or "not allowed" in low or "-1719" in low)
+        denied = (
+            "assistive", "not allowed", "-1719", "-1743", "not authorized",
+            "not permitted", "operation not permitted",
+        )
+        return not any(token in low for token in denied)
 
     def _screen_recording_ok(self) -> bool:
         probe = Path("/tmp") / f"relay-screen-probe-{int(time.time())}.png"
@@ -363,6 +376,67 @@ end tell'''
         width, height = size
         if (x <= 3 and y <= 3) or (x >= width - 4 and y <= 3) or (x <= 3 and y >= height - 4) or (x >= width - 4 and y >= height - 4):
             raise PauseRequested("mouse is in a screen corner (failsafe)")
+
+    def read_dialog(self, process_name: str, title_contains: str = "") -> tuple[str, list[str]] | None:
+        """Read an approval sheet/dialog through Accessibility. No language model is involved.
+
+        Returns (text, button labels), or None when no sheet/dialog is open. Raises ScreenError
+        when Accessibility cannot be read: Relay must never approve what it cannot read.
+        """
+        script = f'''
+tell application "System Events"
+    if not (exists process "{_as_escape(process_name)}") then return "NO_PROCESS"
+    tell process "{_as_escape(process_name)}"
+        repeat with w in windows
+            try
+                if "{_as_escape(title_contains)}" is "" or ((name of w as string) contains "{_as_escape(title_contains)}") then
+                    set dlg to missing value
+                    try
+                        if exists sheet 1 of w then set dlg to sheet 1 of w
+                    end try
+                    if dlg is missing value then
+                        try
+                            if exists dialog 1 of w then set dlg to dialog 1 of w
+                        end try
+                    end if
+                    if dlg is missing value then return "NONE"
+                    set out to ""
+                    repeat with e in (entire contents of dlg)
+                        try
+                            if class of e is static text then
+                                set out to out & (value of e as text) & linefeed
+                            end if
+                        end try
+                    end repeat
+                    set out to out & "---BUTTONS---" & linefeed
+                    repeat with e in (entire contents of dlg)
+                        try
+                            if class of e is button then
+                                set out to out & (name of e as text) & linefeed
+                            end if
+                        end try
+                    end repeat
+                    return out
+                end if
+            end try
+        end repeat
+    end tell
+end tell
+return "NONE"'''
+        result = self._run([OSASCRIPT, "-e", script], timeout=25)
+        if result.returncode != 0:
+            raise ScreenError(
+                "could not read the approval dialog through Accessibility: "
+                + (result.stderr.strip() or result.stdout.strip() or "osascript failed")
+            )
+        output = result.stdout.strip()
+        if output in ("", "NONE", "NO_PROCESS"):
+            return None
+        if "---BUTTONS---" not in output:
+            return (output, [])
+        text, buttons = output.split("---BUTTONS---", 1)
+        labels = [line.strip() for line in buttons.splitlines() if line.strip()]
+        return (text.strip(), labels)
 
     def click_button(self, process_name: str, title_contains: str, label: str) -> bool:
         """Click a button by Accessibility label. Never focuses or raises the window."""

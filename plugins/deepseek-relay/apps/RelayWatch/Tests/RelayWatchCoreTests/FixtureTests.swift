@@ -13,7 +13,7 @@ enum Fixtures {
         "model.decision_applied", "model.requested", "model.declined", "fix.plan_requested",
         "limit.cap_reached", "limit.decision_applied", "blocked.cleared", "decision.asked",
         "decision.answered", "decision.waiting", "decision.reminder", "decision.timeout",
-        "decision.rejected", "route.judgment", "route.decided", "route.after_decision",
+        "decision.rejected", "decision.tamper", "route.judgment", "route.decided", "route.after_decision",
         "stall.detected", "gui.focus", "gui.click", "gui.type", "gui.ring", "gui.ring.retry",
         "gui.model", "gui.new_session", "gui.screenshot", "vision.check", "popup.seen",
         "popup.approved", "popup.escalated", "recovery.start", "recovery.action", "recovery.end",
@@ -132,5 +132,59 @@ final class FixtureTests: XCTestCase {
             id: "D-007", question: "Which storage?", options: [], round: 4, kind: nil, returnTo: nil
         )
         XCTAssertEqual(decision.command, "relay decide D-007 --code <code> \"your answer\"")
+    }
+}
+
+
+final class GlyphAndWakeTests: XCTestCase {
+    func testActivePhaseWithAStaleHeartbeatIsRedWithoutANewEvent() {
+        let symbol = MenuGlyph.symbol(
+            phase: "CODE", pendingDecision: false, halt: false, paused: false, stopped: false,
+            chainOK: true, error: false, heartbeatAge: 600
+        )
+        XCTAssertEqual(symbol, "exclamationmark.octagon.fill")
+    }
+
+    func testFreshActivePhaseIsGreen() {
+        XCTAssertEqual(
+            MenuGlyph.symbol(
+                phase: "REVIEW", pendingDecision: false, halt: false, paused: false, stopped: false,
+                chainOK: true, error: false, heartbeatAge: 20
+            ),
+            "circle.fill"
+        )
+    }
+
+    func testPendingDecisionPausedAndDoneGlyphs() {
+        func symbol(_ phase: String, pending: Bool = false, paused: Bool = false) -> String {
+            MenuGlyph.symbol(
+                phase: phase, pendingDecision: pending, halt: false, paused: paused, stopped: false,
+                chainOK: true, error: false, heartbeatAge: 10
+            )
+        }
+        XCTAssertEqual(symbol("WAIT_HUMAN", pending: true), "questionmark.circle.fill")
+        XCTAssertEqual(symbol("PAUSED", paused: true), "pause.circle")
+        XCTAssertEqual(symbol("DONE"), "checkmark.circle")
+        XCTAssertEqual(
+            MenuGlyph.symbol(
+                phase: "CODE", pendingDecision: false, halt: false, paused: false, stopped: false,
+                chainOK: false, error: false, heartbeatAge: 10
+            ),
+            "exclamationmark.octagon.fill"
+        )
+    }
+
+    func testHeartbeatWritesNeverWakeTheViewer() {
+        XCTAssertFalse(WatchPaths.isRelevant("/p/.relay/HEARTBEAT.json"))
+        XCTAssertFalse(WatchPaths.isRelevant("/p/.relay/monitor/HEARTBEAT.json"))
+        XCTAssertFalse(WatchPaths.isRelevant("/p/.relay/BATON.json"))
+        XCTAssertTrue(WatchPaths.isRelevant("/p/.relay/journal/2026-10-21.jsonl"))
+        XCTAssertTrue(WatchPaths.isRelevant("/p/.relay/STATE.json"))
+        XCTAssertFalse(WatchPaths.isRelevant("/p/.relay/journal/screens/2026-10-21/claude.png"))
+        XCTAssertFalse(WatchPaths.isRelevant("/p/.relay/journal/calls/call-abc.json"))
+        XCTAssertFalse(WatchPaths.hasRelevant(["/p/.relay/HEARTBEAT.json"]))
+        XCTAssertTrue(
+            WatchPaths.hasRelevant(["/p/.relay/HEARTBEAT.json", "/p/.relay/journal/2026-10-21.jsonl"])
+        )
     }
 }

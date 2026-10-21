@@ -8,7 +8,7 @@ Everything you need is in the `.relay/` folder of this project. Assume a fresh s
 
 ## Non-negotiables
 
-1. Read `.relay/HANDOFF.md`, `.relay/DECISIONS.md`, and `.relay/MONITOR_NOTES.md` before doing anything else. If `.relay/FIX_PLAN.md` exists, follow it for the issues it names.
+1. Read `.relay/HANDOFF.md`, `.relay/DECISIONS.md`, and `.relay/MONITOR_NOTES.md` before doing anything else. If `.relay/REVIEW.md` is newer than your last report, address every requested change in it. Follow `.relay/FIX_PLAN.md` only when the pointer names it.
 2. Write source code and ONLY these `.relay/` files: `.relay/CODER_REPORT.md`, `.relay/CODER_DONE.json`, `.relay/CHECKPOINT_coder.md`.
 3. Never edit `.relay/PLAN.md`, `.relay/HANDOFF.md`, `.relay/REVIEW.md`, `.relay/STATE.json`, `.relay/BATON.json`, `.relay/DECISIONS.md`, or `.relay/MONITOR_NOTES.md`.
 4. Never make a product, UX, scope, cost, data, or security decision. If one is needed, stop and report `needs_decision` with a clear question and 2-4 options.

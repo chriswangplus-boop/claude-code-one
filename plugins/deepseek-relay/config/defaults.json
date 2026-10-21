@@ -65,7 +65,7 @@
     "^allow .* to read (?:a )?file(?: .*)?\\??$",
     "^allow .* to edit (?:a )?file in (?:the )?project(?: .*)?\\??$",
     "^run (?:the )?tests?(?: .*)?\\??$",
-    "^allow git (status|diff|add|commit)(?: .*)?\\??$"
+    "^allow git (status|diff)(?: .*)?\\??$"
   ],
   "screenshot_retention_days": 14,
   "ntfy": {
@@ -100,7 +100,7 @@
     "require_instruction_confirmation": true
   },
   "popup_allow_commands": [
-    "^git (status|diff|add|commit)(?: [^;&|`$<>\\n]*)?$",
+    "^git (status|diff)(?: [^;&|`$<>\\n]*)?$",
     "^(?:pytest|python3? -m pytest)(?: [^;&|`$<>\\n]*)?$"
   ]
 }

@@ -21,6 +21,7 @@ final class RelayController: ObservableObject {
     private var filter = EventFilter()
     private var watcher: FSEventsWatcher?
     private var heartbeatTimer: Timer?
+    private var stalenessTimer: Timer?
     private var visibleCount = 0
     private var bookmarkData: Data?
 
@@ -106,9 +107,18 @@ final class RelayController: ObservableObject {
 
     private func startWatcher(for folder: RelayFolder) {
         watcher?.stop()
+        // Watch only the journal (plus the two files whose changes matter between events).
+        // Watching `.relay/` recursively made the monitor/orchestrator heartbeats wake the
+        // app every few seconds for nothing (N7).
         let journal = folder.url(".relay/journal")
-        let relay = folder.url(".relay")
-        let watcher = FSEventsWatcher(paths: [journal, relay], latency: 3.0) { [weak self] in
+        var paths = [journal]
+        for relative in [".relay/STATE.json", ".relay/PENDING_DECISION.md"] {
+            let url = folder.url(relative)
+            if FileManager.default.fileExists(atPath: url.path) { paths.append(url) }
+        }
+        let watcher = FSEventsWatcher(paths: paths, latency: 3.0) { [weak self] paths in
+            // Heartbeats are written every 10-25 s; they must not wake the UI (N7).
+            guard WatchPaths.hasRelevant(paths) else { return }
             Task { @MainActor in self?.filesChanged() }
         }
         self.watcher = watcher
@@ -171,6 +181,26 @@ final class RelayController: ObservableObject {
         } else {
             lastUpdate = "no events yet"
         }
+        scheduleStalenessCheck()
+    }
+
+    /// One wake-up at heartbeat + 5 minutes, so a dead Relay turns the glyph red without any
+    /// new journal event (N7). Once stale, no further timer is armed; a file event re-arms it.
+    private func scheduleStalenessCheck() {
+        stalenessTimer?.invalidate()
+        stalenessTimer = nil
+        guard let heartbeat = snapshot.orchestratorHeartbeat, let age = heartbeat.age() else { return }
+        guard age < 300 else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: max(1, 300 - age + 1), repeats: false) {
+            [weak self] _ in
+            Task { @MainActor in
+                self?.reloadSnapshot()
+                self?.scheduleStalenessCheck()
+            }
+        }
+        timer.tolerance = 10
+        RunLoop.main.add(timer, forMode: .common)
+        stalenessTimer = timer
     }
 
     func inspectorEvent(for round: Int) -> JournalEvent? {
@@ -205,23 +235,32 @@ final class RelayController: ObservableObject {
         heartbeatTimer = nil
     }
 
+    deinit {
+        heartbeatTimer?.invalidate()
+        stalenessTimer?.invalidate()
+    }
+
     // MARK: - Menu bar
 
     var menuGlyph: String {
-        if snapshot.state?.phase == "DONE" { return "checkmark.circle" }
-        if pendingDecision != nil { return "questionmark.circle.fill" }
-        if snapshot.halt != nil || !chain.ok || error != nil { return "exclamationmark.octagon.fill" }
-        if snapshot.state?.phase == "PAUSED" || snapshot.pause != nil || snapshot.stop != nil {
-            return "pause.circle"
+        MenuGlyph.symbol(
+            phase: snapshot.state?.phase,
+            pendingDecision: pendingDecision != nil,
+            halt: snapshot.halt != nil,
+            paused: snapshot.state?.phase == "PAUSED",
+            stopped: snapshot.pause != nil || snapshot.stop != nil,
+            chainOK: chainHealthy,
+            error: error != nil,
+            heartbeatAge: snapshot.orchestratorHeartbeat?.age()
+        )
+    }
+
+    private var chainHealthy: Bool {
+        guard chain.ok else { return false }
+        if let verification = ChainChecker.monitorVerification(events), verification.ok == false {
+            return false
         }
-        let active = ["PLAN", "CODE", "REVIEW", "ROUTE"].contains(snapshot.state?.phase ?? "")
-        if active, let age = snapshot.orchestratorHeartbeat?.age(), age > 300 {
-            return "exclamationmark.octagon.fill"  // active but the heartbeat is stale
-        }
-        if let age = snapshot.orchestratorHeartbeat?.age(), age < 300 {
-            return "circle.fill"
-        }
-        return "circle"
+        return true
     }
 
     var menuColor: Color {

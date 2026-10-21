@@ -296,12 +296,12 @@ class Monitor:
             pass
         try:
             journal_ok, journal_errors = self.journal.verify()
-            events = self.journal.all_events()
+            events = self.journal.trusted_events()
         except Exception as exc:  # malformed journal is itself a finding
             journal_ok = False
             journal_errors = [f"{type(exc).__name__}: {exc}"]
             try:
-                events = self.journal.all_events() if False else list(self.journal.events(strict=False))
+                events = self.journal.trusted_events()
             except Exception:
                 events = []
         state_error = None
