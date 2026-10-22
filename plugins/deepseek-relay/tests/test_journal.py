@@ -5,8 +5,6 @@ import threading
 import pytest
 
 from relay.errors import JournalError
-from relay.journal import Journal
-from relay.state import FileLock
 
 
 def _append_many(journal, n):
@@ -212,3 +210,18 @@ def test_a_truncated_journal_is_detected_by_the_anchor(ctx, paths):
     ok, errors = ctx.journal.verify()
     assert not ok
     assert any("anchor" in error for error in errors)
+
+
+def test_ids_stay_monotonic_when_the_clock_moves_back_a_day(ctx):
+    """A backwards clock must not restart ids or fork the chain inside an old day file."""
+    ctx.journal.append("turn.start", round_no=1, detail={"role": "coder"})
+    before = ctx.journal.all_events()[-1]
+    ctx.clock.advance(days=-5)
+    event = ctx.journal.append("turn.end", round_no=1, detail={"role": "coder"})
+
+    assert event["prev_hash"] == before["hash"]
+    assert event["id"] > before["id"]
+    ids = [item["id"] for item in ctx.journal.all_events()]
+    assert len(ids) == len(set(ids))
+    ok, errors = ctx.journal.verify()
+    assert ok, errors

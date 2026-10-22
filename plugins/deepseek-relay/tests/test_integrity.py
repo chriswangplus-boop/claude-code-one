@@ -1,4 +1,3 @@
-import json
 import subprocess
 import os
 import time
@@ -7,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from relay import integrity
-from relay.errors import SecretDetected
+from relay.errors import IntegrityError, SecretDetected
 from relay.integrity import (
     changed_paths,
     git_commit,
@@ -301,7 +300,7 @@ def test_git_commit_never_runs_a_planted_pre_commit_hook(tmp_path):
     assert not marker.exists(), "the pre-commit hook ran"
 
 
-def test_git_status_never_runs_a_planted_fsmonitor(tmp_path):
+def test_git_status_refuses_a_planted_fsmonitor(tmp_path):
     git_init(tmp_path)
     write(tmp_path, "a.txt", "one")
     assert git_commit(tmp_path, "base")
@@ -312,9 +311,67 @@ def test_git_status_never_runs_a_planted_fsmonitor(tmp_path):
         check=True, capture_output=True,
     )
 
-    git_snapshot(tmp_path)
+    # R3-5: a neutralised fsmonitor is not enough; the call is refused outright.
+    with pytest.raises(IntegrityError, match="core.fsmonitor"):
+        git_snapshot(tmp_path)
 
     assert not marker.exists(), "core.fsmonitor ran"
+    assert integrity.git_config_risks(tmp_path)
+
+
+def test_a_clean_smudge_filter_never_runs(tmp_path):
+    """R3-5: `.git/config` filter.x.clean plus `*.txt filter=x` is refused before git starts."""
+    git_init(tmp_path)
+    write(tmp_path, "a.txt", "one")
+    assert git_commit(tmp_path, "base")
+    marker = tmp_path / "filter-ran"
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "filter.evil.clean", f"touch {marker}; cat"],
+        check=True, capture_output=True,
+    )
+    write(tmp_path, ".gitattributes", "*.txt filter=evil\n")
+    write(tmp_path, "a.txt", "two")
+
+    with pytest.raises(IntegrityError, match="filter.evil.clean"):
+        git_commit(tmp_path, "two")
+
+    assert not marker.exists(), "the clean filter ran"
+    assert any("filter=evil" in risk for risk in integrity.git_attribute_risks(tmp_path))
+
+
+def test_a_filter_attribute_alone_is_refused(tmp_path):
+    git_init(tmp_path)
+    write(tmp_path, "a.md", "one")
+    write(tmp_path, ".gitattributes", "*.md filter=evil\n")
+    assert any("filter=evil" in risk for risk in integrity.git_control_risks(tmp_path))
+    with pytest.raises(IntegrityError, match="filter=evil"):
+        integrity.assert_git_control_safe(tmp_path)
+
+
+def test_an_included_config_is_scanned(tmp_path):
+    git_init(tmp_path)
+    write(tmp_path, "evil.cfg", '[filter "evil"]\n\tclean = touch /tmp/x; cat\n')
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "include.path", "../evil.cfg"],
+        check=True, capture_output=True,
+    )
+    risks = integrity.git_config_risks(tmp_path)
+    assert any("filter.evil.clean" in risk for risk in risks)
+
+
+def test_lfs_filters_are_allowlisted_but_a_credential_helper_is_not(tmp_path):
+    git_init(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "filter.lfs.clean", "git-lfs clean -- %f"],
+        check=True, capture_output=True,
+    )
+    assert integrity.git_config_risks(tmp_path) == []
+
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "credential.helper", "!steal-credentials"],
+        check=True, capture_output=True,
+    )
+    assert any("credential.helper" in risk for risk in integrity.git_config_risks(tmp_path))
 
 
 def test_git_control_snapshot_sees_hooks_and_config(tmp_path):

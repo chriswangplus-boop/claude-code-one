@@ -10,13 +10,14 @@ import re
 import sys
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
 from .brain import Brain
-from .config import Config
+from .config import Config, ntfy_token, ntfy_topic
 from .context import Context
-from .decisions import accept_decision, hash_code, local_answer, new_code, write_pending
+from .decisions import (
+    accept_decision, decision_fingerprint, hash_code, local_answer, new_code, write_pending,
+)
 from .errors import (
     AppMismatch, BrainError, BudgetExceeded, ContextGuardTripped, HumanRequired, IntegrityError,
     JournalError, PauseRequested, RelayError, SecretDetected, StateError,
@@ -68,6 +69,9 @@ class _NullNotifier:
 
 
 ISSUE_ID = re.compile(r"^[a-z0-9-]{3,40}$")
+# Relay rewrites these on every start/resume, so they cannot be part of a persisted baseline;
+# their writes are covered by the signed journal and the decision record instead.
+BASELINE_EXCLUDED = (".relay/STATE.json", ".relay/BATON.json")
 
 
 def _issue_ids(sentinel: dict) -> list[str]:
@@ -81,15 +85,6 @@ def _issue_ids(sentinel: dict) -> list[str]:
         if ISSUE_ID.match(text) and text not in seen:
             seen.append(text)
     return seen[:10]
-
-
-def _strip_answer_line(text: str) -> str:
-    """Drop the human's ANSWER line: editing only that line is the intended way to answer."""
-    kept = [
-        line for line in str(text or "").splitlines()
-        if not line.strip().upper().startswith("ANSWER:")
-    ]
-    return "\n".join(kept)
 
 
 def _match_option(answer: str, options: list[dict]) -> str | None:
@@ -267,8 +262,19 @@ class Orchestrator:
             raise StateError("this project is not initialized; run `relay init` first")
         # Migrate a legacy journal once: the HMAC anchor starts at today's tail.
         self.journal.ensure_anchor()
+        # R3-4: only the live attempt's baseline is kept.
+        live_pending = self._state().get("pending")
+        keep = set()
+        if isinstance(live_pending, dict) and live_pending.get("attempt_id"):
+            keep.add(str(live_pending["attempt_id"]))
+        self.trust.prune_attempts(keep)
+        state = self._state()
+        has_pending = isinstance(state.get("pending"), dict)
         if self._first_prepare:
-            self.store.mutate(lambda current: current.__setitem__("active_session", {}))
+            # A resumed turn's baseline is only meaningful if Relay does not rewrite STATE.json
+            # before the turn is processed (R3-4).
+            if not has_pending:
+                self.store.mutate(lambda current: current.__setitem__("active_session", {}))
             self._first_prepare = False
         state = self._state()
         if state.get("phase") == "WAIT_HUMAN" and not state.get("pending_decision") and state.get("return_to"):
@@ -307,7 +313,8 @@ class Orchestrator:
                 current["started_at"] = started_at
             current["run_id"] = self._run_id
 
-        self.store.mutate(stamp)
+        if not has_pending:
+            self.store.mutate(stamp)
         state = self._state()
         self.store.heartbeat(phase=state.get("phase"), round=state.get("round", 0))
         try:
@@ -320,6 +327,20 @@ class Orchestrator:
             raise JournalError(f"{exc}; run `relay journal repair`") from exc
 
     # --- guards -----------------------------------------------------------
+    def _require_trusted_journal(self) -> None:
+        """R3-1: authorization evidence must come from an intact, signed journal."""
+        ok, errors = self.journal.verify()
+        if ok:
+            return
+        try:
+            self.journal.append(
+                "integrity.violation", detail={"kind": "journal", "errors": errors[:5]},
+                result="blocked",
+            )
+        except JournalError:
+            pass
+        raise PauseRequested("journal integrity check failed: " + errors[0])
+
     def _check_guards(self) -> None:
         for name, message in (
             ("stop", "stopped by user"),
@@ -502,6 +523,7 @@ class Orchestrator:
 
     def _apply_human_opus_request(self, last: dict) -> None:
         """`relay instruct --opus` or a decision answer that says "Use Opus" arms an Opus turn."""
+        state = self._state()
         answer = str(last.get("answer") or "")
         decision_id = str(last.get("id") or "")
         if "use opus" not in answer.lower() or state.get("human_opus_applied") == decision_id:
@@ -678,9 +700,26 @@ class Orchestrator:
             model_verified = pending.get("model_verified", "unverifiable")
             effort_verified = pending.get("effort_verified", "unverifiable")
             escalated = bool(pending.get("escalated"))
+            attempt_id = str(pending.get("attempt_id") or "")
+            baseline = self.trust.attempt(attempt_id) if attempt_id else None
+            if baseline is None:
+                # R3-4: without the baseline saved before the pointer was typed, a crash would
+                # make everything the agent wrote the new baseline. Refuse and let the human
+                # reconcile explicitly (`relay resume --adopt-baseline`).
+                raise PauseRequested(
+                    "this pending turn has no signed baseline in the trust folder (it predates "
+                    "R3-4 or the folder was removed). Inspect the project, then run "
+                    "`relay resume --adopt-baseline` to accept the current files as the baseline."
+                )
+            before = dict(baseline.get("files") or {})
+            for rel in BASELINE_EXCLUDED:
+                path = self.cfg.project_dir / rel
+                if path.exists():
+                    before[rel] = sha256_file(path)
+            git_before = dict(baseline.get("git") or {})
             self.journal.append(
                 "turn.resume", state=phase, round_no=round_no,
-                detail={"role": role, "expected": expected, "resumed": True},
+                detail={"role": role, "expected": expected, "resumed": True, "attempt_id": attempt_id},
             )
         else:
             choice = self._choose_turn(phase, state)
@@ -736,6 +775,7 @@ class Orchestrator:
             issue_ids = list(choice.issue_ids)
             plan_issues = list(getattr(choice, "fix_plan_issues", ()) or ())
             counted: dict = {}
+            attempt_id = uuid.uuid4().hex[:12]
 
             def apply(current: dict) -> None:
                 # N9: the Opus counter and `pending` are in one save, so a crash cannot
@@ -761,6 +801,7 @@ class Orchestrator:
                     "escalated": escalated,
                     "issue_ids": issue_ids,
                     "trigger": choice.trigger,
+                    "attempt_id": attempt_id,
                 }
 
             self.store.mutate(apply)
@@ -795,19 +836,35 @@ class Orchestrator:
                 )
                 self._process_turn(
                     phase=phase, role=role, round_no=round_no, sentinel=sentinel,
-                    before=snapshot(self.cfg.project_dir), driver=driver,
+                    before=before, driver=driver, git_before=git_before,
+                    attempt_id=attempt_id,
                 )
                 return
             sentinel_path.unlink(missing_ok=True)
 
         if resuming:
+            # Forget the crashed chat so the role is re-opened and re-seeded (P2-7).
+            app = role_app(role)
+            self.store.mutate(
+                lambda current: current.setdefault("active_session", {}).pop(app, None)
+            )
             sentinel_path.unlink(missing_ok=True)
             self._ensure_session(role, round_no)
 
         sentinel_path.unlink(missing_ok=True)
         self.store.heartbeat(phase=phase, round=round_no)
         self.store.set_baton(role, role, round_no)
-        before = snapshot(self.cfg.project_dir)
+        if not resuming:
+            before = snapshot(self.cfg.project_dir)
+        # R3-4: the baselines are saved, signed, outside the project BEFORE anything is typed.
+        self.trust.store_attempt(
+            attempt_id,
+            {
+                "attempt_id": attempt_id, "phase": phase, "role": role, "round": round_no,
+                "files": {k: v for k, v in before.items() if k not in BASELINE_EXCLUDED},
+                "git": git_before, "started_wall": started_wall,
+            },
+        )
         turn_event = self.journal.append(
             "turn.start",
             state=phase,
@@ -817,13 +874,14 @@ class Orchestrator:
                 "model": model, "effort": effort, "model_verified": model_verified,
                 "effort_verified": effort_verified,
                 "trigger": (pending.get("trigger") if resuming else choice.trigger),
+                "attempt_id": attempt_id,
                 "snapshot_sha256": sha256_text(canonical_json(before)),
                 "watched_files": len(before),
                 "git_status": git_snapshot(self.cfg.project_dir)[:20]
                 if bool(self.cfg.get("git.enabled", True)) else [],
             },
         )
-        self._ring(driver, role, pointer, round_no, do_model=False)
+        self._ring(driver, role, pointer, round_no, do_model=False, kind="task", attempt_id=attempt_id)
         spec = WaitSpec(
             role=role,
             round_no=round_no,
@@ -836,8 +894,7 @@ class Orchestrator:
         sentinel = self._wait(spec)
         self._process_turn(
             phase=phase, role=role, round_no=round_no, sentinel=sentinel, before=before, driver=driver,
-            turn_start_id=turn_event["id"],
-            git_before=git_before if not resuming else None,
+            turn_start_id=turn_event["id"], git_before=git_before, attempt_id=attempt_id,
         )
 
     def _ensure_session(self, role: str, round_no: int, *, force_new: bool = False) -> None:
@@ -862,7 +919,7 @@ class Orchestrator:
                 self._checkpoint_before_switch(str(outgoing), round_no)
         driver = self.drivers[app]
         self._recover(driver, role, driver.new_session)
-        self._ring(driver, role, self._seed_pointer(role), round_no)
+        self._ring(driver, role, self._seed_pointer(role), round_no, kind="seed")
         phase = state.get("phase")
 
         def apply(current: dict) -> None:
@@ -891,11 +948,20 @@ class Orchestrator:
         started_wall = self.wall()
         self.store.set_baton(outgoing, outgoing, round_no)
         before = snapshot(self.cfg.project_dir)
+        git_before = git_control_snapshot(self.cfg.project_dir)
+        attempt_id = uuid.uuid4().hex[:12]
+        self.trust.store_attempt(attempt_id, {
+            "attempt_id": attempt_id, "phase": self._state().get("phase"),
+            "role": outgoing, "round": round_no,
+            "files": {k: v for k, v in before.items() if k not in BASELINE_EXCLUDED},
+            "git": git_before,
+            "kind": "checkpoint",
+        })
         start = self.journal.append(
             "session.checkpoint.start", round_no=round_no,
             detail={"role": outgoing, "reason": "role switch", "checkpoint": checkpoint_rel},
         )
-        self._ring(driver, outgoing, pointer, round_no)
+        self._ring(driver, outgoing, pointer, round_no, kind="checkpoint", attempt_id=attempt_id)
         spec = WaitSpec(
             role=outgoing, round_no=round_no, expected_file=checkpoint_rel, pointer=pointer,
             timeout_minutes=self._timeout_minutes(outgoing), started_epoch=self.clock.epoch(),
@@ -908,6 +974,7 @@ class Orchestrator:
                 reason="checkpoint not completed",
             )
         after = snapshot(self.cfg.project_dir)
+        self._require_trusted_journal()
         violations = ownership_violations(
             before, after, outgoing, active_role=outgoing,
             events=self.journal.trusted_events(), turn_start_id=start["id"],
@@ -916,6 +983,7 @@ class Orchestrator:
             raise PauseRequested(f"checkpoint wrote files it does not own: {violations[0]['path']}")
         commit = None
         if bool(self.cfg.get("auto_commit", True)) and bool(self.cfg.get("git.enabled", True)):
+            self._git_control_guard(git_before, round_no, self._state().get("phase"), "the checkpoint commit")
             commit = git_commit(self.cfg.project_dir, f"relay: round {round_no} checkpoint {outgoing}")
             if commit:
                 self.journal.append(
@@ -927,6 +995,7 @@ class Orchestrator:
         state["session_rounds"][outgoing] = 0
         state["session_ctx"][outgoing] = 0
         self.store.save(state)
+        self.trust.clear_attempt(attempt_id)
         checkpoint = self.cfg.project_dir / checkpoint_rel
         self.journal.append(
             "session.checkpoint", round_no=round_no,
@@ -935,6 +1004,23 @@ class Orchestrator:
                 "sha256": sha256_file(checkpoint) if checkpoint.exists() else None,
             },
         )
+
+    def _git_control_guard(
+        self, before: dict[str, str], round_no: int, phase: str | None, where: str,
+    ) -> None:
+        """R3-5: compare git control files before *every* commit, not only at turn end."""
+        changed = git_control_changes(before, git_control_snapshot(self.cfg.project_dir))
+        if not changed:
+            return
+        self.journal.append(
+            "integrity.violation", state=phase, round_no=round_no,
+            detail={"kind": "git_control", "paths": changed, "where": where}, result="blocked",
+        )
+        self._abort_turn(
+            f"git control files changed before {where}: " + ", ".join(changed[:5]),
+            phase, paths=changed,
+        )
+        raise PauseRequested(f"git control file changed before {where}")
 
     def _process_turn(
         self,
@@ -947,23 +1033,14 @@ class Orchestrator:
         driver: AppDriver,
         turn_start_id: str | None = None,
         git_before: dict[str, str] | None = None,
+        attempt_id: str | None = None,
     ) -> None:
         after = snapshot(self.cfg.project_dir)
         changed = changed_paths(before, after)
+        self._require_trusted_journal()
 
         if git_before is not None:
-            git_changed = git_control_changes(git_before, git_control_snapshot(self.cfg.project_dir))
-            if git_changed:
-                # A hook, fsmonitor or config change can make git run arbitrary code.
-                self.journal.append(
-                    "integrity.violation", state=phase, round_no=round_no,
-                    detail={"kind": "git_control", "paths": git_changed}, result="blocked",
-                )
-                self._abort_turn(
-                    "git control files changed during the turn: " + ", ".join(git_changed[:5]),
-                    phase, paths=git_changed,
-                )
-                raise PauseRequested("git control file changed during the turn")
+            self._git_control_guard(git_before, round_no, phase, "the turn's commit")
         pending = self._state().get("pending") if isinstance(self._state().get("pending"), dict) else {}
         model = pending.get("model")
         effort = pending.get("effort")
@@ -1137,6 +1214,8 @@ class Orchestrator:
 
         self.store.mutate(apply)
         self.store.clear_baton()
+        if attempt_id:
+            self.trust.clear_attempt(attempt_id)
         self.journal.append(
             "turn.end",
             state=phase,
@@ -1231,11 +1310,20 @@ class Orchestrator:
         started_wall = self.wall()
         self.store.set_baton(role, role, round_no)
         before = snapshot(self.cfg.project_dir)
+        git_before = git_control_snapshot(self.cfg.project_dir)
+        attempt_id = uuid.uuid4().hex[:12]
+        self.trust.store_attempt(attempt_id, {
+            "attempt_id": attempt_id, "phase": self._state().get("phase"),
+            "role": role, "round": round_no,
+            "files": {k: v for k, v in before.items() if k not in BASELINE_EXCLUDED},
+            "git": git_before,
+            "kind": "rollover",
+        })
         rollover_start = self.journal.append(
             "rollover.start", round_no=round_no,
             detail={"role": role, "reason": reason, "checkpoint": checkpoint_rel},
         )
-        self._ring(driver, role, pointer, round_no)
+        self._ring(driver, role, pointer, round_no, kind="checkpoint", attempt_id=attempt_id)
         spec = WaitSpec(
             role=role, round_no=round_no, expected_file=checkpoint_rel, pointer=pointer,
             timeout_minutes=self._timeout_minutes(role), started_epoch=self.clock.epoch(),
@@ -1249,6 +1337,7 @@ class Orchestrator:
                 reason="checkpoint not completed",
             )
         after = snapshot(self.cfg.project_dir)
+        self._require_trusted_journal()
         violations = ownership_violations(
             before, after, role, active_role=role,
             events=self.journal.trusted_events(), turn_start_id=rollover_start["id"],
@@ -1257,6 +1346,7 @@ class Orchestrator:
             self._abort_turn(f"checkpoint wrote files it does not own: {violations[0]['path']}", self._state().get("phase"))
             raise PauseRequested("ownership violation during rollover")
         if bool(self.cfg.get("auto_commit", True)) and bool(self.cfg.get("git.enabled", True)):
+            self._git_control_guard(git_before, round_no, self._state().get("phase"), "the rollover commit")
             commit = git_commit(self.cfg.project_dir, f"relay: round {round_no} checkpoint {role}")
             if commit:
                 self.journal.append(
@@ -1264,7 +1354,7 @@ class Orchestrator:
                 )
         self._recover(driver, role, driver.new_session)
         seed = self._seed_pointer(role)
-        self._ring(driver, role, seed, round_no)
+        self._ring(driver, role, seed, round_no, kind="seed")
 
         def apply(current: dict) -> None:
             # Reload under the lock so a concurrent decision/instruct is not lost.
@@ -1274,6 +1364,7 @@ class Orchestrator:
 
         self.store.mutate(apply)
         self.store.clear_baton()
+        self.trust.clear_attempt(attempt_id)
         checkpoint = self.cfg.project_dir / checkpoint_rel
         if checkpoint.exists():
             try:
@@ -1322,6 +1413,7 @@ class Orchestrator:
         source = self.cfg.project_dir / ".relay/FIX_PLAN.md"
         if not source.exists():
             return
+        git_before = git_control_snapshot(self.cfg.project_dir)
         self.paths.archive_dir.mkdir(parents=True, exist_ok=True)
         target = self.paths.archive_dir / f"FIX_PLAN-{round_no}.md"
         suffix = 2
@@ -1338,6 +1430,7 @@ class Orchestrator:
         )
         self.store.mutate(lambda current: current.update({"fix_plan_issues": []}))
         if bool(self.cfg.get("auto_commit", True)) and bool(self.cfg.get("git.enabled", True)):
+            self._git_control_guard(git_before, round_no, self._state().get("phase"), "the FIX_PLAN archive commit")
             commit = git_commit(self.cfg.project_dir, f"relay: archive FIX_PLAN after round {round_no}")
             if commit:
                 self.journal.append(
@@ -1374,7 +1467,7 @@ class Orchestrator:
                 )
         elif phase == "CODE" and role == "fixer":
             issues = ", ".join(getattr(choice, "issue_ids", ()) or ()) or "the named issues"
-            plan = f".relay/FIX_PLAN.md, " if fix_plan else ""
+            plan = ".relay/FIX_PLAN.md, " if fix_plan else ""
             text = (
                 f"RELAY round {round_no} role=fixer: fix only {issues}. Read .relay/REVIEW.md "
                 f"(sha256 {self._hint('.relay/REVIEW.md')}), {plan}.relay/HANDOFF.md, {decisions}, {notes} "
@@ -1383,7 +1476,7 @@ class Orchestrator:
                 ".relay/FIX_REPORT.md, then .relay/CLAUDE_DONE.json last."
             )
         elif phase == "CODE":
-            plan = f".relay/FIX_PLAN.md, " if fix_plan else ""
+            plan = ".relay/FIX_PLAN.md, " if fix_plan else ""
             # N3: after CHANGES_REQUESTED the review IS the handoff for this turn.
             review_first = (state.get("last_turn") or {}).get("verdict") == "CHANGES_REQUESTED"
             review = (
@@ -1471,14 +1564,36 @@ class Orchestrator:
             self.journal.append("recovery.retry", detail={"app": driver.name, "role": role})
             return action()
 
-    def _ring(self, driver: AppDriver, role: str, pointer: str, round_no: int, *, do_model: bool = True) -> bool | None:
+    def _ring(
+        self, driver: AppDriver, role: str, pointer: str, round_no: int, *,
+        do_model: bool = True, kind: str = "task", attempt_id: str | None = None,
+    ) -> bool | None:
         driver.wait_for_idle(int(self.cfg.get("user_idle_seconds", 30)))
         self._recover(driver, role, driver.focus)
+        model = effort = None
         if do_model and role != "coder":
             model, effort = self._model(role)
             driver.select_model(model, effort, role)
         driver.ring(pointer)
         sent = driver.verify_sent()
+        # R3-8: one event per message typed into an app (task, seed, nudge, retry, checkpoint),
+        # so every model request is countable, with its backend, role, model and effort.
+        self.journal.append(
+            "app.request",
+            round_no=round_no,
+            detail={
+                "app": driver.name,
+                "backend": driver.name,
+                "role": role,
+                "kind": kind,
+                "model": model,
+                "effort": effort,
+                "chars": len(pointer),
+                "attempt_id": attempt_id,
+                "sent": sent,
+            },
+            result="ok" if sent is not False else "unconfirmed",
+        )
         self.journal.append(
             "gui.ring",
             round_no=round_no,
@@ -1494,6 +1609,15 @@ class Orchestrator:
         if sent is False:
             driver.ring(pointer)
             sent = driver.verify_sent()
+            self.journal.append(
+                "app.request", round_no=round_no,
+                detail={
+                    "app": driver.name, "backend": driver.name, "role": role, "kind": "retry",
+                    "model": model, "effort": effort, "chars": len(pointer),
+                    "attempt_id": attempt_id, "sent": sent,
+                },
+                result="ok" if sent is not False else "failed",
+            )
             self.journal.append(
                 "gui.ring.retry", round_no=round_no, detail={"role": role, "sent": sent},
                 result="ok" if sent is not False else "failed",
@@ -1616,7 +1740,10 @@ class Orchestrator:
                 self._last_busy is None and now - spec.started_epoch >= max(nudge_after * 2, 600)
             )
             if nudges < max_nudges and now - spec.started_epoch >= nudge_after and idle:
-                self._ring(driver, spec.role, self._nudge_pointer(spec), spec.round_no, do_model=False)
+                self._ring(
+                    driver, spec.role, self._nudge_pointer(spec), spec.round_no,
+                    do_model=False, kind="nudge",
+                )
                 nudges += 1
                 self.journal.append("turn.nudge", round_no=spec.round_no, detail={"role": spec.role})
             self.store.heartbeat(phase=self._state().get("phase"), round=spec.round_no)
@@ -1840,6 +1967,8 @@ class Orchestrator:
             chosen["id"] = decision_id
             round_no = int(current.get("round", 0))
             return_to_value = return_to or current.get("phase")
+            chosen["return_to"] = str(return_to_value)
+            chosen["round"] = round_no
             current["decisions"] = int(current.get("decisions", 0)) + 1
             # Only the id is in the project; the code hash is in the external trust store.
             self.ctx.trust.store_code(
@@ -1877,45 +2006,75 @@ class Orchestrator:
             reason=reason or question,
             clock=self.clock,
         )
+        self.trust.store_decision(
+            {
+                "id": decision_id,
+                "question_sha256": sha256_text(question),
+                "options": clean_options,
+                "kind": kind,
+                "data": data,
+                "return_to": chosen.get("return_to") or return_to or state.get("phase"),
+                "round": int(chosen.get("round", state.get("round", 0))),
+                "code_hash": hash_code(code),
+                "asked_at": asked_at,
+            }
+        )
+        self.trust.set_wait_fingerprint(
+            decision_id, *decision_fingerprint(self._state(), self.paths)
+        )
         self.store.set_baton("human", "human", int(state.get("round", 0)))
+        self._decision_codes[decision_id] = code
+        # R3-7: the code is the only thing separating a human answer from an agent answer. It
+        # must never appear in a desktop notification or on a process command line (osascript,
+        # argv), because a computer-use agent can read those. Only the phone (ntfy with an
+        # access token) or an interactive terminal may carry it.
+        phone_delivery = bool(
+            bool(self.cfg.get("notify.ntfy", True))
+            and (self.cfg.get("ntfy.token") or ntfy_token())
+            and (self.cfg.get("ntfy.topic") or ntfy_topic())
+        )
+        tty_delivery = bool(sys.stdout.isatty())
+        if tty_delivery:
+            print(
+                f"Relay needs a decision {decision_id}. One-time answer code: {code}",
+                file=sys.stderr,
+            )
+        delivery = {"tty": tty_delivery, "phone": phone_delivery, "desktop": False}
         self.journal.append(
             "decision.asked",
             state="WAIT_HUMAN",
             round_no=int(state.get("round", 0)),
             detail={
                 "id": decision_id, "question": question, "options": clean_options,
-                "reason": reason, "kind": kind,
+                "reason": reason, "kind": kind, "code_delivery": delivery,
             },
         )
-        self._decision_codes[decision_id] = code
-        if sys.stdout.isatty():
-            print(
-                f"Relay needs a decision {decision_id}. One-time answer code: {code}",
-                file=sys.stderr,
+        if not (tty_delivery or phone_delivery):
+            self.journal.append(
+                "decision.code_undelivered", detail={"id": decision_id}, result="warn"
+            )
+        if phone_delivery:
+            ntfy_body = (
+                f"{decision_id}: {truncate(question, 180)}. "
+                f"One-time answer code: {code}"
+            )
+        else:
+            ntfy_body = (
+                f"{decision_id}: {truncate(question, 180)}. "
+                "The answer code is shown only in the terminal running Relay."
             )
         self._notify(
             f"Relay needs a decision ({decision_id})",
             f"{decision_id}: {truncate(question, 220)}",
             decision_id=decision_id,
             urgent=True,
-            desktop_extra=f"One-time answer code: {code}",
-            ntfy_body=(
-                f"{decision_id}: {truncate(question, 180)}. "
-                "The answer code is shown in the desktop notification."
-            ),
+            desktop_extra=None,
+            ntfy_body=ntfy_body,
         )
         return decision_id
 
     def _decision_fingerprint(self) -> tuple[str, str]:
-        state_digest = sha256_file(self.paths.state) if self.paths.state.exists() else ""
-        pending_digest = ""
-        if self.paths.pending_decision.exists():
-            try:
-                text = self.paths.pending_decision.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                text = ""
-            pending_digest = sha256_text(_strip_answer_line(text))
-        return state_digest, pending_digest
+        return decision_fingerprint(self._state(), self.paths)
 
     def _decision_tampered(self, decision_id: str, reason: str) -> None:
         self.journal.append(
@@ -1928,8 +2087,14 @@ class Orchestrator:
         pending = state.get("pending_decision") or {}
         decision_id = pending.get("id")
         self.journal.append("decision.waiting", detail={"id": decision_id})
-        # N1 fix 4: any change to STATE.json or the question text while we wait is tampering.
-        baseline = self._decision_fingerprint()
+        # N1 fix 4 / R3-2: the fingerprint is persisted, so a restart cannot take a fresh
+        # baseline from whatever an agent edited on disk while Relay was stopped.
+        stored = self.trust.wait_fingerprint(str(decision_id)) if decision_id else None
+        if stored is None:
+            stored = self._decision_fingerprint()
+            if decision_id:
+                self.trust.set_wait_fingerprint(str(decision_id), *stored)
+        baseline = stored
         reminder_seconds = float(self.cfg.get("decision_reminder_hours", 4)) * 3600
         last_reminder = self.clock.epoch()
         last_bad_answer: str | None = None
@@ -1974,18 +2139,26 @@ class Orchestrator:
                 return
             if reminder_seconds > 0 and self.clock.epoch() - last_reminder >= reminder_seconds:
                 code = self._decision_codes.get(str(decision_id))
+                phone = bool(
+                    bool(self.cfg.get("notify.ntfy", True))
+                    and (self.cfg.get("ntfy.token") or ntfy_token())
+                    and (self.cfg.get("ntfy.topic") or ntfy_topic())
+                )
                 self._notify(
                     f"Reminder: Relay is waiting ({decision_id})",
                     f"{decision_id}: {truncate(str((state.get('pending_decision') or {}).get('question', '')), 200)}",
                     decision_id=decision_id,
                     urgent=True,
-                    desktop_extra=(f"One-time answer code: {code}" if code else
-                                   "Use the code from the original desktop notification."),
+                    desktop_extra=None,
+                    ntfy_body=(
+                        f"{decision_id}: still waiting. One-time answer code: {code}"
+                        if phone and code
+                        else f"{decision_id}: still waiting. Answer from the terminal running Relay."
+                    ),
                 )
                 self.journal.append("decision.reminder", detail={"id": decision_id})
                 state["notification"]["last_sent_at"] = self.clock.now().isoformat()
                 self.store.save(state)
-                baseline = self._decision_fingerprint()
                 last_reminder = self.clock.epoch()
             if deadline is not None and self.clock.epoch() >= deadline:
                 self.journal.append("decision.timeout", detail={"id": decision_id}, result="still waiting")
@@ -2030,6 +2203,9 @@ class Orchestrator:
         self, reason: str, phase: str | None,
         *, paths: list[str] | None = None, hashes: dict[str, str | None] | None = None,
     ) -> None:
+        live = self._state().get("pending")
+        attempt_id = str(live.get("attempt_id") or "") if isinstance(live, dict) else ""
+
         def apply(current: dict) -> None:
             current["pending"] = None
             current["blocked"] = {
@@ -2046,6 +2222,8 @@ class Orchestrator:
 
         self.store.mutate(apply)
         self.store.clear_baton()
+        if attempt_id:
+            self.trust.clear_attempt(attempt_id)
         try:
             self.journal.append(
                 "state.paused", state="PAUSED",

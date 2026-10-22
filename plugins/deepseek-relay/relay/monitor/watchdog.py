@@ -6,13 +6,11 @@ import re
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from ..brain import Brain
 from ..config import Config
 from ..context import Context
-from ..errors import BrainError
 from ..redact import redact
 from ..state import atomic_write_json, read_json
 from ..util import sha256_file, truncate

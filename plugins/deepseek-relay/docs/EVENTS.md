@@ -78,6 +78,7 @@ the decoder. Unknown `detail` fields are ignored.
 | `gui.focus` | no | `app`, `title` |
 | `gui.click` | no | `app`, `target` |
 | `gui.type` | no | `app`, `chars`, `submit` |
+| `app.request` | no | `app`, `backend`, `role`, `kind`, `model`, `effort`, `chars`, `attempt_id`, `sent` |
 | `gui.ring` | no | `role`, `app`, `chars`, `sent` |
 | `gui.ring.retry` | no | `role`, `sent` |
 | `gui.model` | no | `app`, `role`, `model`, `effort`, `model_verified` |

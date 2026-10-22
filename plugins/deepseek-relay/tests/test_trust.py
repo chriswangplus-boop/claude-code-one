@@ -7,6 +7,7 @@ import json
 import pytest
 
 from relay import decisions
+from relay.context import open_project
 from relay.decisions import accept_decision, hash_code, record_instruction
 from relay.errors import StateError
 from relay.integrity import ownership_violations, snapshot
@@ -137,7 +138,11 @@ def test_accept_decision_uses_the_external_code_not_state_json(ctx):
             "options": [], "code_hash": hash_code("agentchosen"),
         },
     }))
-    ctx.trust.store_code("D-001", hash_code(code), {"round": 1})
+    ctx.trust.store_decision({
+        "id": "D-001", "question_sha256": sha256_text("q"),
+        "options": [], "kind": None, "data": {}, "return_to": "CODE", "round": 1,
+        "code_hash": hash_code(code), "asked_at": "2026-10-21T00:00:00+00:00",
+    })
 
     with pytest.raises(StateError, match="invalid one-time code"):
         accept_decision(ctx, "use JSON", "agentchosen")
@@ -148,3 +153,138 @@ def test_accept_decision_uses_the_external_code_not_state_json(ctx):
     assert result["phase"] == "CODE"
     assert len(ctx.journal.of_type("decision.answered")) == 1
     assert ctx.trust.code_hash("D-001") is None
+
+
+# --- R3-1: a genuine signature does not make a rewritten body trustworthy -------------
+
+def test_a_replayed_signed_event_with_a_new_body_is_not_trusted(ctx, paths):
+    ctx.store.ensure()
+    ctx.journal.append(
+        "decision.answered", actor="human", round_no=1,
+        detail={"id": "D-000", "answer": "the real human answer"},
+    )
+    genuine = ctx.journal.all_events()[-1]
+    start = ctx.journal.append("turn.start", round_no=1, detail={"role": "coder"})
+
+    # The probe: keep the genuine `hash` and `sig`, change the body, append as a new event.
+    forged = json.loads(json.dumps(genuine))
+    forged["id"] = "evt-20261020-09999"
+    forged["type"] = "decision.answered"
+    forged["detail"] = {"id": "D-002", "answer": "agent wrote this"}
+    forged["prev_hash"] = start["hash"]
+    file = sorted(paths.journal_dir.glob("*.jsonl"))[-1]
+    with open(file, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(forged, sort_keys=True) + "\n")
+
+    trusted = ctx.journal.trusted_events()
+    assert not any(event["id"] == forged["id"] for event in trusted)
+    assert not any(event.get("detail", {}).get("id") == "D-002" for event in trusted)
+
+    before = snapshot(ctx.cfg.project_dir)
+    state = ctx.store.load()
+    state["pending_decision"] = {"id": "D-002", "question": "agent-edited"}
+    ctx.store.save(state)
+    after = snapshot(ctx.cfg.project_dir)
+
+    violations = ownership_violations(
+        before, after, "coder", events=trusted, turn_start_id=start["id"],
+    )
+    assert any(item["path"] == ".relay/STATE.json" for item in violations)
+
+    ok, errors = ctx.journal.verify()
+    assert not ok
+    assert any("hash mismatch" in error for error in errors)
+
+
+def test_trusted_events_stops_at_the_first_broken_line(ctx, paths):
+    ctx.store.ensure()
+    ctx.journal.append("turn.start", round_no=1, detail={"role": "coder"})
+    ctx.journal.append("turn.end", round_no=1, detail={"role": "coder"})
+    ctx.journal.append("integrity.ok", round_no=1, detail={"role": "coder"})
+    ctx.journal.append("state.transition", round_no=1, detail={"to": "REVIEW"})
+    file = sorted(paths.journal_dir.glob("*.jsonl"))[-1]
+    lines = file.read_text(encoding="utf-8").splitlines()
+    tampered = json.loads(lines[-2])  # integrity.ok; keep the tip intact
+    tampered["detail"]["role"] = "planner"
+    lines[-2] = json.dumps(tampered, sort_keys=True)
+    file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    trusted = ctx.journal.trusted_events()
+    # turn.start is the anchor; turn.end is the only event before the broken line.
+    assert [event["type"] for event in trusted] == ["turn.end"]
+
+
+# --- R3-2: a human answer is bound to the question that was asked ---------------------
+
+OPTIONS_R3 = [
+    {"label": "JSON", "consequence": "simple"},
+    {"label": "SQLite", "consequence": "robust"},
+]
+
+
+def _escalate(orch):
+    orch.store.ensure()
+    decision_id = orch.escalate_human(
+        "Which storage?", OPTIONS_R3, reason="test", return_to="PLAN",
+        kind="round_cap", data={"cap": "max_total_rounds"},
+    )
+    return decision_id, orch._decision_codes[decision_id]
+
+
+def test_editing_the_pending_decision_while_stopped_is_refused(ctx):
+    from relay.errors import IntegrityError
+    from relay.orchestrator import Orchestrator
+
+    orch = Orchestrator(ctx, {}, notifier=FakeNotifier())
+    decision_id, code = _escalate(orch)
+    assert ctx.trust.decision(decision_id)["return_to"] == "PLAN"
+
+    # The agent edits the display copy while the loop is stopped.
+    ctx.store.mutate(lambda state: state["pending_decision"].__setitem__("return_to", "CODE"))
+
+    with pytest.raises(IntegrityError, match="changed while the decision was pending"):
+        accept_decision(ctx, "JSON", code)
+    assert ctx.journal.of_type("decision.answered") == []
+    assert ctx.store.load()["phase"] == "WAIT_HUMAN"
+    assert ctx.trust.decision(decision_id) is not None
+
+
+def test_a_decision_record_survives_a_restart_and_governs_the_answer(ctx):
+    from relay.orchestrator import Orchestrator
+
+    orch = Orchestrator(ctx, {}, notifier=FakeNotifier())
+    decision_id, code = _escalate(orch)
+    # A fresh context, as after a restart: the signed record is the only source of meaning.
+    restarted = open_project(ctx.cfg.project_dir, env={}, clock=ctx.clock)
+    result = accept_decision(restarted, "SQLite", code)
+
+    assert result["phase"] == "PLAN"
+    state = restarted.store.load()
+    assert state["last_decision"]["return_to"] == "PLAN"
+    assert state["last_decision"]["kind"] == "round_cap"
+    assert state["last_decision"]["data"] == {"cap": "max_total_rounds"}
+    assert restarted.trust.decision(decision_id) is None
+    assert restarted.trust.wait_fingerprint(decision_id) is None
+
+
+def test_a_pending_decision_without_a_signed_record_cannot_be_answered(ctx):
+    code = "legacycode"
+    ctx.store.mutate(lambda state: state.update({
+        "phase": "WAIT_HUMAN", "return_to": "CODE", "round": 1,
+        "pending_decision": {"id": "D-001", "question": "q", "return_to": "CODE", "round": 1},
+    }))
+    ctx.trust.store_code("D-001", hash_code(code), {"round": 1})
+
+    with pytest.raises(StateError, match="no signed record"):
+        accept_decision(ctx, "answer", code)
+    assert ctx.journal.of_type("decision.answered") == []
+
+
+def test_the_record_never_stores_the_code_in_plaintext(ctx):
+    from relay.orchestrator import Orchestrator
+
+    orch = Orchestrator(ctx, {}, notifier=FakeNotifier())
+    _, code = _escalate(orch)
+    stored = (ctx.trust.root / "decisions.json").read_text(encoding="utf-8")
+    assert code not in stored
+    assert code not in ctx.paths.state.read_text()

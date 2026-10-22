@@ -20,7 +20,7 @@ from .config import (
 )
 from .context import Context, open_project
 from .decisions import accept_decision, confirm_human, record_instruction
-from .errors import ConfigError, RelayError, StateError
+from .errors import ConfigError, JournalError, RelayError, StateError
 from .integrity import prune_screens
 from .model_policy import opus_usage
 from .monitor import Monitor
@@ -112,6 +112,28 @@ def _spawn_monitor(ctx: Context, *, allow_sync: bool) -> bool:
     return True
 
 
+def _refuse_unsafe_supervisors(ctx: Context, probe=None) -> None:
+    """R3-7: the answer code must not be readable by the app Relay supervises."""
+    from .guard import supervisor_risks
+
+    risks = supervisor_risks(ctx.cfg, probe)
+    if not risks:
+        return
+    try:
+        ctx.journal.append(
+            "security.refused", detail={"risks": risks, "kind": "supervisor_permissions"},
+            result="blocked",
+        )
+    except JournalError:
+        pass
+    raise ConfigError(
+        "a supervisor app holds screen or accessibility permission, so it could read the "
+        "one-time answer code: " + ", ".join(risks) + ". Revoke Screen Recording and "
+        "Accessibility for it in System Settings > Privacy & Security, turn off its computer "
+        "use, then run `relay start` again."
+    )
+
+
 def _runtime(ctx: Context, args) -> tuple[dict, Brain | None, bool]:
     if bool(getattr(args, "fake", False)):
         from .demo import DemoApps
@@ -156,6 +178,9 @@ def _runtime(ctx: Context, args) -> tuple[dict, Brain | None, bool]:
         brain = _brain(ctx)
         if bool(ctx.cfg.get("deepseek.vision", True)) and not bool(ctx.cfg.get("deepseek.text_only_mode", False)):
             vision = brain.vision
+    # R3-7: a supervisor that can read the screen or the accessibility tree could read the
+    # one-time answer code and answer its own question, so refuse to start.
+    _refuse_unsafe_supervisors(ctx)
     from .apps import make_claude_driver, make_zcode_driver
 
     drivers = {
@@ -272,6 +297,7 @@ def cmd_calibrate(args) -> int:
 def cmd_start(args) -> int:
     ctx = _ctx(args)
     _initialized(ctx)
+    _refuse_unsafe_supervisors(ctx)
     state = ctx.store.load()
     if state.get("phase") == "PAUSED":
         raise ConfigError("Relay is paused. Run `relay resume` to continue.")
@@ -293,13 +319,52 @@ def cmd_resume(args) -> int:
             "run `relay resume --clear-halt`."
         )
     if args.clear_halt:
+        ok, errors = ctx.journal.verify()
+        if not ok:
+            raise ConfigError(
+                "journal integrity check failed, so the halt cannot be cleared: "
+                + "; ".join(errors[:3])
+            )
         previous = ctx.store.read_flag("halt") or {}
         ctx.store.clear_flag("halt")
         ctx.journal.append(
             "human.halt_cleared", actor="human",
             detail={"previous_reason": previous.get("reason")},
         )
+    if getattr(args, "adopt_baseline", False):
+        _adopt_baseline(ctx)
     return _run_loop(ctx, args, resume=True)
+
+
+def _adopt_baseline(ctx: Context) -> None:
+    """R3-4: the human explicitly accepts the current files as a pending turn's baseline."""
+    import uuid
+
+    from .integrity import git_control_snapshot, snapshot
+
+    state = ctx.store.load()
+    pending = state.get("pending")
+    if not isinstance(pending, dict):
+        print("no pending turn to adopt a baseline for")
+        return
+    attempt_id = str(pending.get("attempt_id") or uuid.uuid4().hex[:12])
+    # Save the attempt id in STATE first: its own write must not land after the baseline.
+    ctx.store.mutate(lambda current: current["pending"].__setitem__("attempt_id", attempt_id))
+    ctx.trust.store_attempt(attempt_id, {
+        "attempt_id": attempt_id,
+        "phase": pending.get("phase"),
+        "role": pending.get("role"),
+        "round": pending.get("round"),
+        "files": snapshot(ctx.cfg.project_dir),
+        "git": git_control_snapshot(ctx.cfg.project_dir),
+        "started_wall": pending.get("started_wall"),
+        "kind": "adopted",
+    })
+    ctx.journal.append(
+        "baseline.adopted", detail={"attempt_id": attempt_id, "role": pending.get("role")},
+        result="warn",
+    )
+    print(f"adopted the current files as the baseline for attempt {attempt_id}")
 
 
 def _spawn_detached(ctx: Context, args) -> int:
@@ -621,6 +686,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume = sub.add_parser("resume", parents=[common], help="resume a paused or waiting loop")
     resume.add_argument("--clear-halt", action="store_true", help="clear a monitor HALT after review")
+    resume.add_argument(
+        "--adopt-baseline", action="store_true",
+        help="adopt the current files as the signed baseline of a pending turn that predates R3-4",
+    )
     resume.add_argument("--fake", action="store_true")
     resume.add_argument("--no-monitor", action="store_true")
     resume.add_argument("--no-brain", action="store_true")

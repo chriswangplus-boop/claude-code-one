@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Protocol
 
 from ..clock import RealClock
 from ..config import Config
@@ -183,7 +183,7 @@ class DeepSeekClient:
         shape_error: str | None = None
         try:
             text = str(response["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError) as exc:
+        except (KeyError, IndexError, TypeError):
             text = ""
             shape_error = f"DeepSeek returned an unexpected response shape: {str(response)[:200]}"
         content = None

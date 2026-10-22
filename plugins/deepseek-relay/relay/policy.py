@@ -36,22 +36,97 @@ FORBIDDEN_FLAGS = {
     "--work-tree", "--no-index", "--basetemp", "--override-ini", "--plugin",
 }
 
+# R3-6: per-command allowlist of options. Anything not listed goes to the human, and the
+# value of an option (`--opt=value` or `--opt value`) must pass the same path rules.
+PYTEST_OPTIONS = {
+    "-q", "-v", "-x", "-s", "-k", "-m", "-r", "-W",
+    "--maxfail", "--tb", "--color", "--no-header", "--strict-markers",
+    "--disable-warnings", "--durations", "--collect-only", "--co", "--lf", "--ff",
+    "--ignore",
+}
+GIT_OPTIONS = {
+    "-s", "-b", "-M", "-U", "--short", "--porcelain", "--name-only", "--name-status",
+    "--stat", "--cached", "--staged", "--quiet", "--no-ext-diff", "--no-color",
+    "--color", "--relative", "--untracked-files", "--ignore-submodules", "--ignored",
+    "--column", "--ahead-behind", "--branch", "--long", "--show-stash", "--renames",
+    "--find-renames", "--diff-filter", "--ignore-space-at-eol", "--ignore-all-space",
+    "--ignore-blank-lines", "--unified", "--word-diff", "--exit-code", "--check",
+    "--binary", "--patch", "--full-index", "--abbrev", "--src-prefix", "--dst-prefix",
+}
+# Options whose value is a path: its value is always checked even without a slash.
+PYTEST_PATH_OPTIONS = {"--ignore"}
+PYTEST_OPEN_VALUES = {"-k", "-m", "-r", "-W", "--maxfail", "--tb", "--color", "--durations"}
+GIT_OPEN_VALUES = {
+    "-U", "-M", "--unified", "--diff-filter", "--find-renames", "--stat", "--color",
+    "--porcelain", "--untracked-files", "--ignore-submodules", "--word-diff", "--abbrev",
+    "--src-prefix", "--dst-prefix",
+}
+
+
+def _path_value_ok(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    if text.startswith(("/", "~", "..")) or text == ".git" or text.startswith(".git/"):
+        return False
+    if "/../" in text or "\\" in text:
+        return False
+    return True
+
+
+def _strip_interpreter(tokens: list[str]) -> list[str]:
+    if len(tokens) >= 3 and tokens[1] == "-m" and tokens[0].split("/")[-1].startswith("python"):
+        return tokens[2:]
+    return tokens
+
 
 def command_arguments_are_safe(command: str) -> bool:
-    """Reject flags that write outside the project or load agent code, and absolute paths."""
+    """Reject flags that write outside the project or load agent code, and bad option values."""
     try:
-        tokens = shlex.split(command)
+        tokens = _strip_interpreter(shlex.split(command))
     except ValueError:
         return False
-    for token in tokens[1:]:
-        lowered = token.lower()
-        flag = lowered.split("=", 1)[0]
-        if flag in FORBIDDEN_FLAGS or lowered in FORBIDDEN_FLAGS:
+    if not tokens:
+        return False
+    program = tokens[0].lower()
+    if program == "git":
+        allowed, open_values, path_options = GIT_OPTIONS, GIT_OPEN_VALUES, set()
+    elif program == "pytest":
+        allowed, open_values, path_options = PYTEST_OPTIONS, PYTEST_OPEN_VALUES, PYTEST_PATH_OPTIONS
+    else:
+        return False
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return all(_path_value_ok(rest) for rest in tokens[index + 1:])
+        if token.startswith("-") and token != "-":
+            flag, sep, value = token.partition("=")
+            if flag in FORBIDDEN_FLAGS:
+                return False
+            if flag.startswith("-") and not flag.startswith("--") and len(flag) > 2:
+                # Combined short flags: every letter must be allowlisted (`git status -sb`).
+                if not all(f"-{letter}" in allowed for letter in flag[1:]):
+                    return False
+                index += 1
+                continue
+            if flag not in allowed:
+                return False
+            if sep:
+                if not _path_value_ok(value):
+                    return False
+            elif flag in path_options:
+                index += 1
+                if index >= len(tokens) or not _path_value_ok(tokens[index]):
+                    return False
+            elif flag in open_values and index + 1 < len(tokens):
+                if not _path_value_ok(tokens[index + 1]):
+                    return False
+            index += 1
+            continue
+        if not _path_value_ok(token):
             return False
-        if lowered.startswith(("-p", "-c", "-o")) and lowered not in ("-",):
-            return False
-        if token.startswith(("/", "~", "../")) or "/../" in token or token.startswith(".git/"):
-            return False
+        index += 1
     return True
 
 

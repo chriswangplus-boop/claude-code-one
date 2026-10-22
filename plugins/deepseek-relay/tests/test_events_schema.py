@@ -55,7 +55,6 @@ def test_every_documented_event_is_emitted_with_its_fields(ctx):
 
 def test_real_loop_emits_the_part_b_fields(ctx):
     """Emission proof on a plain fake-driver run, not just the fixture builder."""
-    from relay.context import open_project
     from relay.demo import DemoApps
     from relay.notify import FakeNotifier
     from relay.orchestrator import Orchestrator

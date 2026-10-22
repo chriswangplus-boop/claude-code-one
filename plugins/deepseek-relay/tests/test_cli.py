@@ -1,9 +1,9 @@
 import json
-from pathlib import Path
 
 from relay.cli import main
 from relay.context import open_project
 from relay.decisions import hash_code, new_code, write_pending
+from relay.util import sha256_text
 
 
 def run(*args) -> int:
@@ -61,7 +61,12 @@ def test_decide_answers_locally(tmp_path, capsys):
         "options": [],
     }
     ctx.store.save(state)
-    ctx.trust.store_code("D-001", hash_code(code), {"round": 2})
+    ctx.trust.store_decision({
+        "id": "D-001", "question_sha256": sha256_text("JSON or SQLite?"),
+        "options": [{"label": "JSON", "consequence": "simple"}], "kind": None,
+        "data": {}, "return_to": "REVIEW", "round": 2, "code_hash": hash_code(code),
+        "asked_at": "2026-10-21T00:00:00+00:00",
+    })
     write_pending(
         ctx.paths, decision_id="D-001", question="JSON or SQLite?",
         context_lines=["storage choice"], options=[{"label": "JSON", "consequence": "simple"}],
@@ -190,3 +195,39 @@ def test_instruction_confirmation_can_be_disabled_explicitly(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "confirmation is disabled" in out
     assert "Auto test instruction" in open_project(project).paths.decisions.read_text()
+
+
+def test_resume_clear_halt_refuses_a_tampered_journal(tmp_path, capsys):
+    project = tmp_path / "proj"
+    assert run("init", "--project", project, "--no-ntfy") == 0
+    ctx = open_project(project)
+    ctx.store.set_flag("halt", {"reason": "test"})
+    ctx.journal.append("monitor.halt", round_no=1, detail={"reason": "test"})
+
+    journal_file = sorted(ctx.paths.journal_dir.glob("*.jsonl"))[-1]
+    lines = journal_file.read_text(encoding="utf-8").splitlines()
+    event = json.loads(lines[-1])
+    event["detail"]["reason"] = "rewritten"
+    lines[-1] = json.dumps(event, sort_keys=True)
+    journal_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert run("resume", "--project", project, "--clear-halt") == 2
+    assert ctx.paths.halt_flag.exists(), "the halt must not be cleared from a tampered journal"
+    assert "journal integrity check failed" in capsys.readouterr().err
+
+
+def test_start_refuses_a_supervisor_with_accessibility(tmp_path, capsys, monkeypatch):
+    project = tmp_path / "proj"
+    assert run("init", "--project", project, "--no-ntfy") == 0
+    config = project / ".relay/config.json"
+    config.write_text(json.dumps({"security": {"supervisor_bundle_ids": ["com.example.claude"]}}))
+    monkeypatch.setattr(
+        "relay.guard.system_tcc_grants",
+        lambda: {"com.example.claude": {"kTCCServiceAccessibility"}},
+    )
+    capsys.readouterr()
+
+    assert run("start", "--project", project, "--fake", "--max-steps", "1") == 2
+    err = capsys.readouterr().err
+    assert "could read the one-time answer code" in err

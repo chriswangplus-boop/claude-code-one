@@ -64,7 +64,12 @@ verifiable. Only rule counts are journaled, never matched text.
   `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat`, commits with
   `--no-verify`, and runs with `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0` and an empty
   `GIT_EXTERNAL_DIFF`. A change to `.git/config`, `.git/info/attributes`, `.gitmodules` or any
-  `.git/hooks/*` file during a turn is an ownership violation and pauses the loop.
+  `.git/hooks/*` file during a turn is an ownership violation and pauses the loop. A git call is
+  also refused outright while `.git/config` (or an included file) or the attributes files select
+  a filter, textconv, merge driver, fsmonitor, sshCommand, gitProxy, credential helper or include
+  that is not explicitly allowlisted (git-lfs and the standard credential helpers are). The
+  git-control comparison runs before every commit, including checkpoints, rollovers and the
+  FIX_PLAN archive.
 
 ## Prompt injection
 
@@ -102,13 +107,23 @@ verifiable. Only rule counts are journaled, never matched text.
 Everything used to prove "a human did this" is kept out of the agent-writable folder, in
 `~/Library/Application Support/Relay/<project-id>/` (mode `0700`, files `0600`):
 
-- the journal HMAC key and the trusted tail anchor;
-- one-time decision codes, as SHA-256 hashes only (never the code itself).
+- the journal HMAC key, the fixed migration anchor and the moving tail;
+- one-time decision codes as SHA-256 hashes (never the code itself), inside a signed decision
+  record that also fixes the question hash, options, kind, data, `return_to` and round;
+- the `WAIT_HUMAN` fingerprint, persisted so a restart cannot take a fresh baseline from disk;
+- the signed file and git-control baselines of the in-flight attempt.
 
-`STATE.json` holds only the decision id. During `WAIT_HUMAN`, Relay fingerprints `STATE.json` and
-the question text and pauses on any change not made by Relay (the human's `ANSWER:` line is
-excluded from the fingerprint). `relay instruct` can only be confirmed in the native macOS dialog;
-stdin is never read, so `echo y | script -qc "relay instruct ..."` cannot record an instruction.
+`STATE.json` keeps only a display copy of the pending decision. Accepting an answer reads the
+signed record, not `STATE.json`, so changing `return_to` or `data` while the loop is stopped
+cannot change what the human's code authorizes. During `WAIT_HUMAN`, Relay compares the persisted
+fingerprint and pauses on any change not made by Relay (the human's `ANSWER:` line is excluded).
+`relay instruct` can only be confirmed in the native macOS dialog; stdin is never read, so
+`echo y | script -qc "relay instruct ..."` cannot record an instruction.
+
+The answer code is delivered only to the phone (ntfy with an access token) or an interactive
+terminal. It is never in a desktop notification or on a process command line, and `relay start`
+refuses when a configured supervisor app holds Screen Recording or Accessibility, because such an
+app could read the code and answer its own question.
 
 Residual risk: an agent with unrestricted shell access as the same user can read the trust folder
 (and thus the HMAC key). Claude Code and Zcode ask permission before touching files outside the
@@ -118,10 +133,13 @@ against a fully compromised user session.
 ## Journal integrity
 
 - Append-only JSONL with a SHA-256 chain across day files.
-- Every event is HMAC-signed with the external key; the last event is pinned by an anchor file in
-  the trust folder. `verify()` reports chain, hash, signature and anchor errors.
-- Ownership evidence and the monitor's history checks use only events whose signature verifies,
-  so a forged `decision.answered` or `human.halt_cleared` is ignored even if it is chained.
+- Every event is HMAC-signed with the external key. A fixed anchor marks the start of trust and a
+  moving tip pins the end, so truncation is detected too. `verify()` reports chain, hash,
+  signature, order and anchor/tip errors.
+- Ownership evidence and the monitor's history checks use `trusted_events()`, which rebuilds each
+  body from its hash, requires the chain, signature and event-id order, and stops at the first
+  broken line. Copying a genuine signed event and changing its body does not make it evidence.
+  `verify()` runs before ownership, decision acceptance and halt clearing; any failure pauses.
 - `relay trace --verify` detects edits, deletions, reordering, truncation and unsigned appends.
 - The monitor verifies the chain every check; a break halts the loop.
 - DeepSeek prompts and responses are stored redacted under `journal/calls/` for `why`/`replay`.

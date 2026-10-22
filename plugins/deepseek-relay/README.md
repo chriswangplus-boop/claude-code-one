@@ -432,6 +432,7 @@ Important knobs:
 ```bash
 cd plugins/deepseek-relay
 python3 -m pytest -q
+python3 -m pyflakes relay tests   # must report nothing
 ```
 
 The suite covers crash-safe state, the hash chain (including tamper detection), ownership,
@@ -441,8 +442,11 @@ fault injection, popup policy, CLI commands and GUI-driver logic with a fake bac
 suite (`tests/test_model_policy.py`) covers the Sonnet default, the first-plan and re-plan Opus
 rules, the fix-plan and fixer ladder, all three fixer ownership limits, the Opus limits and their
 three-option decision, `suggest_escalation` being journaled only, and an unverifiable model typing
-nothing. **167 tests pass** on macOS 27.2 arm64 / Python 3.14.3. Relay Watch adds **20 Swift
-tests** (`swift test` in `apps/RelayWatch`), covering C9 1-5.
+nothing. **223 tests pass** on macOS 27.2 arm64 / Python 3.14.3, and `python3 -m pyflakes relay
+tests` reports nothing. Relay Watch adds **24 Swift tests** (`swift test` in `apps/RelayWatch`),
+covering C9 1-6. The review #3 suite adds git-filter refusal, signed journal evidence, signed
+decision records, persisted turn baselines, option-value path checks, phone-only answer codes and
+the `app.request` counter.
 
 ## Relay Watch (read-only menu-bar viewer)
 

@@ -1,6 +1,5 @@
 import json
 
-import pytest
 
 from relay.brain import Brain
 from relay.notify import Notifier

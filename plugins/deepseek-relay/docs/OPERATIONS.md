@@ -48,6 +48,12 @@ Treat that string as a secret: anyone with the topic can read the pushes (which 
 question and decision ID). Use `ntfy.server` for a self-hosted server and `ntfy.token` for an
 access token.
 
+R3-7: the one-time answer code is delivered **only** to the phone (ntfy with an access token) or,
+when Relay runs in an interactive terminal, printed there. It is never in a desktop notification
+and never on a process command line, because a computer-use agent can read both. `relay start`
+refuses when a supervisor bundle id in `security.supervisor_bundle_ids` holds Screen Recording or
+Accessibility; set that list to the apps Relay supervises.
+
 Answer with:
 
 ```bash
@@ -97,16 +103,29 @@ for now**. There is no config edit to make and no unpickable pause.
 
 ## The trust folder
 
-Decision codes and the journal key are stored outside the project, in
-`~/Library/Application Support/Relay/<project-id>/` (`journal.key`, `journal-anchor.json`,
-`decision-codes.json`; folder `0700`, files `0600`). `relay status` prints the exact path, and
-`RELAY_TRUST_DIR` moves it (tests use a temp dir).
+Everything that proves a human acted is stored outside the project, in
+`~/Library/Application Support/Relay/<project-id>/` (folder `0700`, files `0600`):
+
+| File | Holds |
+|---|---|
+| `journal.key` | the HMAC key for every journal event and every signed record |
+| `journal-anchor.json` | the fixed start of trust (one-time journal migration point) |
+| `journal-tip.json` | the moving tail, so deleting the end of the journal is detected |
+| `decisions.json` | signed decision records: question hash, options, kind, data, return_to, round, code hash |
+| `wait-fingerprint.json` | the decision-relevant `STATE.json` digest while a question is pending |
+| `attempts.json` | signed file and git-control baselines for the in-flight turn |
+| `decision-codes.json` | legacy code hashes (v0.2/v0.3); new decisions use `decisions.json` |
+
+`relay status` prints the exact path, and `RELAY_TRUST_DIR` moves it (tests use a temp dir).
 
 - Do not copy this folder into the project, a repo, or a cloud-synced backup.
-- Deleting it invalidates the decision codes and the journal anchor. Relay re-anchors an old
-  journal once on the next start (older events stay chain-only); every new event is signed.
+- Deleting it invalidates the pending decision records and the journal anchor. Relay re-anchors an
+  old journal once on the next start (older events stay chain-only); every new event is signed.
+  A decision pending at that moment cannot be answered; re-ask it with `relay resume`.
 - Losing `journal.key` means existing signatures can no longer be verified. Keep the project's
   `.relay/` and this folder together in a backup if you back up at all.
+- A pending turn whose baseline is missing (an upgrade from v0.2/v0.3, or a deleted folder) pauses.
+  Inspect the files, then run `relay resume --adopt-baseline` to accept them as the baseline.
 
 ## Failure playbook
 
@@ -118,6 +137,7 @@ Decision codes and the journal key are stored outside the project, in
 | `PAUSED: daily budget` | Inspect `relay status`; raise `daily_budget_usd` deliberately or wait for the next day. |
 | `PAUSED: ownership violation` | An agent wrote another role's file. Read the journal event; revert the file if needed; `relay resume`. The monitor will also halt on this. |
 | `PAUSED: git control file changed` | An agent planted a hook, fsmonitor or `.git/config` change during a turn. Nothing ran (hooks are disabled). Inspect `.git/hooks` and `.git/config`, remove the change, then `relay resume`. |
+| `PAUSED: this pending turn has no signed baseline` | An upgrade or a removed trust folder. Inspect the changed files, then `relay resume --adopt-baseline` (it records the acceptance). |
 | `PAUSED: decision tampering detected` | `STATE.json` or the question text changed while Relay waited for you. Inspect the project and the trust folder; the decision was not accepted. Restore `STATE.json` from git if needed, then `relay resume`. |
 | `WAIT_HUMAN: dialog could not be read` | Accessibility/Automation failed while a dialog was open. Nothing was approved. Check the permissions, close the dialog yourself, then resume. |
 | `relay instruct` refuses to confirm | The native dialog was cancelled or macOS could not show it. Relay never accepts a piped "y". Run it from an interactive session. |

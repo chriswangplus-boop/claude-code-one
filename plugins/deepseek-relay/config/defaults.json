@@ -97,7 +97,8 @@
   "decision_wait_timeout_minutes": 0,
   "security": {
     "allow_google_drive": true,
-    "require_instruction_confirmation": true
+    "require_instruction_confirmation": true,
+    "supervisor_bundle_ids": []
   },
   "popup_allow_commands": [
     "^git (status|diff)(?: [^;&|`$<>\\n]*)?$",

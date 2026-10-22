@@ -209,7 +209,11 @@ final class ReadOnlyTests: XCTestCase {
         let snapshot = RelaySnapshot.load(folder: folder)
         _ = Insights.timeline(initial)
         _ = Insights.alerts(initial)
-        let usage = Insights.usage(events: initial, state: snapshot.state, config: snapshot.config)
+        // Pin "today" to the fixture's day: the fixture must not depend on when the test runs.
+        let day = ISO8601DateFormatter().date(from: "2026-10-21T12:00:00Z")!
+        let usage = Insights.usage(
+            events: initial, state: snapshot.state, config: snapshot.config, now: day
+        )
         _ = Insights.health(snapshot: snapshot, chain: ChainChecker.check(initial), events: initial)
 
         XCTAssertFalse(initial.isEmpty)

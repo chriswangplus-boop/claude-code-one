@@ -10,7 +10,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -24,6 +24,7 @@ from .util import canonical_json, sha256_text
 DAY_FILE = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
 CALL_ID = re.compile(r"^call-[0-9a-f]{12}$")
 EVENT_ID = re.compile(r"^evt-\d{8}-\d{5,}$")
+ORDERED_ID = re.compile(r"^evt-(\d{8})-(\d{5,})$")
 
 REQUIRED_FIELDS = ("id", "ts", "round", "actor", "type", "prev_hash", "hash")
 
@@ -64,7 +65,6 @@ class Journal:
     ) -> dict:
         now = self.clock.now().astimezone()
         day = now.date().isoformat()
-        path = self.paths.journal_dir / f"{day}.jsonl"
         with self.lock:
             tail = self._tail_event()
             seq = 1
@@ -72,8 +72,18 @@ class Journal:
             if tail:
                 prev_hash = str(tail.get("hash", ""))
                 match = re.match(r"^evt-(\d{8})-(\d+)$", str(tail.get("id", "")))
-                if match and match.group(1) == day.replace("-", ""):
-                    seq = int(match.group(2)) + 1
+                if match:
+                    tail_day = match.group(1)
+                    today = day.replace("-", "")
+                    if tail_day > today:
+                        # A clock that moved backwards (NTP, manual change) must not restart
+                        # the id sequence inside the old file: that would duplicate ids and
+                        # fork the chain. Keep the tail's day and go forward.
+                        day = f"{tail_day[:4]}-{tail_day[4:6]}-{tail_day[6:]}"
+                        seq = int(match.group(2)) + 1
+                    elif tail_day == today:
+                        seq = int(match.group(2)) + 1
+            path = self.paths.journal_dir / f"{day}.jsonl"
             event: dict[str, Any] = {
                 "id": f"evt-{day.replace('-', '')}-{seq:05d}",
                 "ts": now.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
@@ -111,8 +121,10 @@ class Journal:
             finally:
                 os.close(fd)
             if self.trust is not None:
-                # The anchor is the tail an agent cannot rewrite without the trust folder.
-                self.trust.set_anchor(str(event["id"]), str(event["hash"]))
+                # The anchor is the fixed start of trust; the tip moves so truncation is caught.
+                if self.trust.anchor() is None:
+                    self.trust.set_anchor(str(event["id"]), str(event["hash"]))
+                self.trust.set_tip(str(event["id"]), str(event["hash"]))
             return event
 
     # --- reading ----------------------------------------------------------
@@ -182,26 +194,92 @@ class Journal:
         return list(self.events())
 
     def trusted_events(self) -> list[dict]:
-        """Events whose HMAC verifies. Ownership checks and the monitor trust only these."""
+        """Events that are provably Relay's: recomputed hash, chain, order and HMAC.
+
+        R3-1: verifying the *stored* `hash` field and its signature is not enough. An agent can
+        copy a genuine signed event, change its body, keep the old `hash`/`sig` and append it.
+        Every event is therefore rebuilt from its body, the chain and signature are checked, and
+        only events after the trusted anchor are counted. Any break stops trust: nothing after a
+        tampered or missing line is evidence.
+        """
         if self.trust is None:
             return self.all_events()
+        anchor = self.trust.anchor()
+        tip = self.trust.tip()
         out: list[dict] = []
+        prev_hash = ""
+        last_id: str | None = None
+        last_seen: dict | None = None
+        broken = False
+        started = anchor is None
         for event in self.events(strict=False):
-            signature = event.get("sig")
-            if signature and self.trust.verify(str(event.get("hash") or ""), str(signature)):
-                out.append(event)
+            last_seen = event
+            event_id = str(event.get("id") or "")
+            if not EVENT_ID.match(event_id):
+                broken = True
+                break
+            body = {key: value for key, value in event.items() if key not in ("hash", "sig")}
+            expected = sha256_text(canonical_json(body))
+            chain_ok = str(event.get("prev_hash") or "") == prev_hash
+            hash_ok = str(event.get("hash") or "") == expected
+            order_ok = True
+            if last_id is not None:
+                previous = ORDERED_ID.match(str(last_id))
+                current = ORDERED_ID.match(event_id)
+                order_ok = bool(previous and current) and (
+                    previous.group(1), int(previous.group(2))
+                ) < (current.group(1), int(current.group(2)))
+            signature = str(event.get("sig") or "")
+            signature_ok = bool(signature) and self.trust.verify(expected, signature)
+            prev_hash = str(event.get("hash") or "")
+            last_id = event_id
+            if not started:
+                if event_id != anchor["event_id"]:  # type: ignore[index]
+                    continue
+                # The anchor itself may predate signing (one-time migration); only its hash
+                # and position must match exactly.
+                if (
+                    not (chain_ok and hash_ok and order_ok)
+                    or str(event.get("hash") or "") != anchor["hash"]  # type: ignore[index]
+                ):
+                    return []
+                started = True
+                continue
+            if not (chain_ok and hash_ok and order_ok and signature_ok):
+                broken = True
+                break
+            out.append(event)
+        if tip is not None and not broken:
+            # Deleting the tail (a truncation) leaves the chain internally consistent, so the
+            # moving tip outside the project is what exposes it. Fail closed on a truncation;
+            # a bad line inside the file only stops trust from that line on.
+            if last_seen is None:
+                return []
+            if (
+                str(last_seen.get("id") or "") != tip["event_id"]
+                or str(last_seen.get("hash") or "") != tip["hash"]
+            ):
+                return []
         return out
 
     def ensure_anchor(self) -> None:
         """Migrate a legacy (unsigned) journal by anchoring its current tail once."""
-        if self.trust is None or self.trust.anchor() is not None:
+        if self.trust is None:
             return
-        try:
-            tail = self._tail_event()
-        except JournalError:
+        anchor = self.trust.anchor()
+        if anchor is None:
+            try:
+                tail = self._tail_event()
+            except JournalError:
+                return
+            if tail:
+                self.trust.set_anchor(str(tail.get("id")), str(tail.get("hash")))
+                self.trust.set_tip(str(tail.get("id")), str(tail.get("hash")))
             return
-        if tail:
-            self.trust.set_anchor(str(tail.get("id")), str(tail.get("hash")))
+        if self.trust.tip() is None:
+            # v0.3 upgrade: the old anchor moved with every append, so it can only serve as the
+            # tip now; new events become the trusted range.
+            self.trust.set_tip(str(anchor.get("event_id")), str(anchor.get("hash")))
 
     def find(self, event_id: str) -> dict | None:
         for event in self.events():
@@ -333,6 +411,7 @@ class Journal:
         parsed: list[dict] = []
         prev_hash: str | None = None
         seen: set[str] = set()
+        last_key: tuple[str, int] | None = None
         for path in self._files():
             for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 if not line.strip():
@@ -355,10 +434,29 @@ class Journal:
                     errors.append(f"{where}: hash mismatch (line was modified)")
                 if event.get("id") in seen:
                     errors.append(f"{where}: duplicate event id {event.get('id')}")
+                match = ORDERED_ID.match(str(event.get("id") or ""))
+                if not match:
+                    errors.append(f"{where}: malformed event id {event.get('id')!r}")
+                else:
+                    key = (match.group(1), int(match.group(2)))
+                    if last_key is not None and key <= last_key:
+                        errors.append(f"{where}: event ids are not in order")
+                    last_key = key
                 seen.add(str(event.get("id")))
                 prev_hash = event.get("hash")
                 parsed.append(event)
         if self.trust is not None:
+            tip = self.trust.tip()
+            if tip:
+                if (
+                    not parsed
+                    or str(parsed[-1].get("id") or "") != tip["event_id"]
+                    or str(parsed[-1].get("hash") or "") != tip["hash"]
+                ):
+                    errors.append(
+                        "the trusted journal tip (anchor) event is missing (the journal was "
+                        "truncated or replaced)"
+                    )
             anchor = self.trust.anchor()
             if anchor:
                 ids = [str(event.get("id")) for event in parsed]

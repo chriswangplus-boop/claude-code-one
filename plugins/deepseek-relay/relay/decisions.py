@@ -10,17 +10,54 @@ import secrets
 import string
 import subprocess
 import sys
-from pathlib import Path
 
 from .clock import utc_iso
 from .context import Context
-from .errors import StateError
+from .errors import IntegrityError, StateError
 from .paths import Paths
 from .state import atomic_write_text
-from .util import truncate
+from .util import canonical_json, sha256_text, truncate
 
 PLACEHOLDER = re.compile(r"^<.*>$")
 CODE_ALPHABET = string.ascii_lowercase
+
+
+def strip_answer_line(text: str) -> str:
+    """Drop the human's ANSWER line: editing only that line is the intended way to answer."""
+    kept = [
+        line for line in str(text or "").splitlines()
+        if not line.strip().upper().startswith("ANSWER:")
+    ]
+    return "\n".join(kept)
+
+
+def decision_state_digest(state: dict) -> str:
+    """Digest of only the decision-relevant state.
+
+    Volatile fields (run_id, updated_at, notifications) change legitimately on restart, so they
+    must not make a pending question look tampered with.
+    """
+    relevant = {
+        "phase": state.get("phase"),
+        "return_to": state.get("return_to"),
+        "round": state.get("round"),
+        "pending_decision": state.get("pending_decision"),
+    }
+    return sha256_text(canonical_json(relevant))
+
+
+def pending_digest(paths: Paths) -> str:
+    if not paths.pending_decision.exists():
+        return ""
+    try:
+        text = paths.pending_decision.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return sha256_text(strip_answer_line(text))
+
+
+def decision_fingerprint(state: dict, paths: Paths) -> tuple[str, str]:
+    return decision_state_digest(state), pending_digest(paths)
 
 
 def new_code() -> str:
@@ -98,7 +135,9 @@ def write_pending(
         "",
         "## Answer",
         "",
-        "The one-time answer code is shown in the desktop notification and terminal, never here.",
+        "The one-time answer code goes only to your phone (ntfy with an access token) and, in an",
+        "interactive terminal, is printed there. It is never written here or in a desktop",
+        "notification (R3-7).",
         "Write it first: `ANSWER: <code> <your answer>`.",
         "Or run: `relay decide <id> --code <code> \"your answer\"`.",
         "",
@@ -190,6 +229,13 @@ def record_instruction(
 
 
 def _accept_locked(ctx: Context, answer: str, code: str, by: str) -> dict:
+    # R3-1: never accept a human answer while the journal cannot be shown to be intact.
+    ok, errors = ctx.journal.verify()
+    if not ok:
+        raise IntegrityError(
+            "journal integrity check failed, so this answer is refused: "
+            + "; ".join(errors[:3])
+        )
     state = ctx.store.load()
     pending = state.get("pending_decision")
     if not isinstance(pending, dict):
@@ -197,30 +243,53 @@ def _accept_locked(ctx: Context, answer: str, code: str, by: str) -> dict:
     decision_id = str(pending.get("id") or "")
     if not decision_id:
         raise StateError("the pending decision has no id; re-ask it with `relay resume`")
-    # The expected hash lives in the external trust store, never in the project (N1).
-    expected = ctx.trust.code_hash(decision_id)
-    if not expected:
+
+    # R3-2: the answer acts only on the signed record written when the question was asked.
+    # STATE.json and PENDING_DECISION.md are display copies; editing them changes nothing.
+    record = ctx.trust.decision(decision_id)
+    if record is None:
         raise StateError(
-            "this pending decision has no external one-time code; re-ask it with `relay resume`"
+            "this pending decision has no signed record in the trust folder; re-ask it with "
+            "`relay resume`"
         )
+    question = str(pending.get("question") or "")
+    if str(record.get("question_sha256") or "") != sha256_text(question):
+        raise IntegrityError(
+            "the pending question was changed after it was asked; refusing the answer"
+        )
+    stored = ctx.trust.wait_fingerprint(decision_id)
+    if stored is not None and stored != decision_fingerprint(state, ctx.paths):
+        raise IntegrityError(
+            "STATE.json or PENDING_DECISION.md changed while the decision was pending; "
+            "refusing the answer"
+        )
+    expected = str(record.get("code_hash") or "")
+    if not expected:
+        raise StateError("this decision record has no one-time code; re-ask it with `relay resume`")
     if not code or not hmac.compare_digest(hash_code(code), expected):
         raise StateError("invalid one-time code")
     answer = _one_line(answer, 2000)
     if not answer:
         raise StateError("the answer is empty")
 
+    return_to = str(record.get("return_to") or "PLAN")
+    round_no = int(record.get("round") or state.get("round", 0))
+    options = record.get("options") or []
+    kind = record.get("kind")
+    data = record.get("data") or {}
+
     event = ctx.journal.append(
         "decision.answered",
         actor=by,
-        round_no=int(state.get("round", 0)),
+        round_no=round_no,
         state="WAIT_HUMAN",
         detail={"id": decision_id, "answer": answer, "source": "local"},
         result="ok",
     )
     entry = [
         "",
-        f"## {decision_id} - {_one_line(pending.get('question', ''))}",
-        f"- round: {pending.get('round', 0)}",
+        f"## {decision_id} - {_one_line(question)}",
+        f"- round: {round_no}",
         f"- answered: {utc_iso(ctx.clock)}",
         f"- answer: {answer}",
         f"- evidence: decision.answered {event['id']} (actor {by})",
@@ -230,14 +299,15 @@ def _accept_locked(ctx: Context, answer: str, code: str, by: str) -> dict:
         with open(ctx.paths.decisions, "a", encoding="utf-8") as fh:
             fh.write("\n".join(entry))
             fh.flush()
+    ctx.trust.clear_decision(decision_id)
     ctx.trust.clear_code(decision_id)
+    ctx.trust.clear_wait_fingerprint()
     atomic_write_text(ctx.paths.answers_dir / f"{decision_id}.txt", answer + "\n")
     try:
         ctx.paths.pending_decision.unlink()
     except FileNotFoundError:
         pass
 
-    return_to = pending.get("return_to") or "PLAN"
     state["phase"] = return_to
     state["pending_decision"] = None
     state["paused_reason"] = None
@@ -248,11 +318,11 @@ def _accept_locked(ctx: Context, answer: str, code: str, by: str) -> dict:
         "event_id": event["id"],
         "answered_at": utc_iso(ctx.clock),
         "return_to": return_to,
-        "round": int(state.get("round", 0)),
-        "kind": pending.get("kind"),
-        "options": pending.get("options") or [],
-        "data": pending.get("data") or {},
+        "round": round_no,
+        "kind": kind,
+        "options": options,
+        "data": data,
     }
-    ctx.store.set_baton("none", None, int(state.get("round", 0)))
+    ctx.store.set_baton("none", None, round_no)
     ctx.store.save(state)
     return {"id": decision_id, "answer": answer, "event_id": event["id"], "phase": return_to}

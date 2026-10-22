@@ -6,12 +6,11 @@ import re
 from collections import deque
 from pathlib import Path
 
-import pytest
 
 from relay.brain.judgments import RouteDecision
 from relay.gui import FakeAppDriver, pointer_role, pointer_round, write_sentinel
 from relay.integrity import ownership_violations
-from relay.model_policy import choose_turn, opus_usage
+from relay.model_policy import choose_turn
 from relay.notify import FakeNotifier
 from relay.orchestrator import Orchestrator
 from relay.setup import init_project
@@ -141,6 +140,9 @@ def build(ctx, apps, *, brain=None, notifier=None, **cfg):
     # These scenarios run several reviews in one milestone; the cap decision has its own test.
     cfg.setdefault("max_rounds_per_milestone", 80)
     cfg.setdefault("max_total_rounds", 400)
+    cfg.setdefault("notify.ntfy", True)
+    cfg.setdefault("ntfy.token", "test-token")
+    cfg.setdefault("ntfy.topic", "test-topic")
     for key, value in cfg.items():
         ctx.cfg.set(key, value)
     brain = brain or StubBrain()
@@ -157,7 +159,7 @@ def claude_turns(ctx):
 
 
 def code_from(notifier) -> str:
-    return re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["desktop_body"]).group(1)
+    return re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["ntfy_body"]).group(1)
 
 
 # --- B5 1 and 11: Sonnet by default, and every Claude turn is journaled -------

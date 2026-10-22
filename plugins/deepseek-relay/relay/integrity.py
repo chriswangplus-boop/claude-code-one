@@ -328,8 +328,137 @@ GIT_SAFE_ENV = {
 
 GIT_CONTROL_PATHS = (".git/config", ".git/info/attributes", ".gitmodules")
 
+# R3-5: neutralising hooks and fsmonitor is not enough. `filter.*.clean/smudge/process`,
+# `diff.*.textconv/command`, `merge.*.driver`, a credential helper, `core.sshCommand` and an
+# `include.path` can all run an agent's command from `.git/config` or `.gitattributes`. Every
+# git call therefore refuses to run while one of those is configured, unless the driver is on
+# this explicit allowlist (git-lfs is the only common safe case).
+GIT_DRIVER_ALLOWLIST = {"lfs"}
+GIT_CREDENTIAL_ALLOWLIST = {"", "osxkeychain", "store", "cache", "libsecret", "manager"}
+GIT_SECTION = re.compile(r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]\s*$')
+
+
+def _config_pairs(text: str):
+    """Yield ((section, subsection), key, value) for a git config file, leniently."""
+    section: tuple[str, str] | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        match = GIT_SECTION.match(line)
+        if match:
+            section = (match.group(1).lower(), (match.group(2) or "").lower())
+            continue
+        if section is None or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        yield section, key.strip().lower(), value.strip().strip('"')
+
+
+def _config_files(root: Path) -> list[Path]:
+    """The local config plus every `include.path` it pulls in (bounded depth)."""
+    root = Path(root)
+    seen: set[Path] = set()
+    out: list[Path] = []
+
+    def add(path: Path, depth: int = 0) -> None:
+        path = path.expanduser()
+        try:
+            path = path.resolve()
+        except OSError:
+            return
+        if depth > 5 or path in seen or not path.is_file():
+            return
+        seen.add(path)
+        out.append(path)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        for (name, sub), key, value in _config_pairs(text):
+            if key == "path" and (name == "include" or name == "includeif"):
+                candidate = Path(value)
+                if not candidate.is_absolute():
+                    candidate = path.parent / candidate
+                add(candidate, depth + 1)
+
+    add(root / ".git" / "config")
+    return out
+
+
+def git_config_risks(root: str | Path) -> list[str]:
+    """Reasons `.git/config` (or an included file) could make git run an agent's command."""
+    risks: list[str] = []
+    for path in _config_files(Path(root)):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        label = path.name if path.name == "config" else str(path)
+        for (name, sub), key, value in _config_pairs(text):
+            lowered = value.strip().lower()
+            if name == "include" or name == "includeif":
+                continue
+            if name == "filter" and sub and key in ("clean", "smudge", "process"):
+                if sub not in GIT_DRIVER_ALLOWLIST:
+                    risks.append(f"{label}: filter.{sub}.{key}")
+            elif name == "diff" and sub and key in ("textconv", "command"):
+                if sub not in GIT_DRIVER_ALLOWLIST:
+                    risks.append(f"{label}: diff.{sub}.{key}")
+            elif name == "merge" and sub and key == "driver":
+                if sub not in GIT_DRIVER_ALLOWLIST:
+                    risks.append(f"{label}: merge.{sub}.driver")
+            elif name == "core" and key in ("fsmonitor", "sshcommand", "gitproxy", "askpass"):
+                if lowered not in ("", "false"):
+                    risks.append(f"{label}: core.{key}")
+            elif name == "credential" and key == "helper":
+                helper = lowered.lstrip("!").split()[0] if lowered.lstrip("!").split() else ""
+                if helper not in GIT_CREDENTIAL_ALLOWLIST:
+                    risks.append(f"{label}: credential.helper")
+    return risks
+
+
+def git_attribute_risks(root: str | Path) -> list[str]:
+    """Reasons `.gitattributes` or `.git/info/attributes` select a non-allowlisted driver."""
+    root = Path(root)
+    risks: list[str] = []
+    for rel in (".gitattributes", ".git/info/attributes"):
+        path = root / rel
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for lineno, raw in enumerate(lines, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            for token in line.split()[1:]:
+                for prefix in ("filter=", "diff=", "merge="):
+                    if token.startswith(prefix):
+                        driver = token[len(prefix):].strip('"').lower()
+                        if driver and driver not in GIT_DRIVER_ALLOWLIST:
+                            risks.append(f"{rel}:{lineno}: {prefix}{driver}")
+    return risks
+
+
+def git_control_risks(root: str | Path) -> list[str]:
+    return git_config_risks(root) + git_attribute_risks(root)
+
+
+def assert_git_control_safe(root: str | Path) -> None:
+    """Refuse any git call while a config or attributes file can execute an agent's command."""
+    risks = git_control_risks(root)
+    if risks:
+        raise IntegrityError(
+            "unsafe git configuration or attributes (a filter, driver or include could run an "
+            "agent's command): " + "; ".join(risks[:5])
+        )
+
 
 def _git(root: Path, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    assert_git_control_safe(root)
     env = {**os.environ, **GIT_SAFE_ENV}
     return subprocess.run(
         ["git", "-C", str(root), *GIT_SAFE_ARGS, *args],

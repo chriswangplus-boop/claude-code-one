@@ -1,16 +1,12 @@
-import json
-import os
 import subprocess
 from pathlib import Path
 import sys
 import textwrap
-import time
 
 import pytest
 
 from relay.errors import StateError
-from relay.paths import Paths
-from relay.state import FileLock, StateStore, atomic_write_json, atomic_write_text, new_state
+from relay.state import FileLock, atomic_write_json, atomic_write_text, new_state
 
 
 def test_state_roundtrip(ctx):

@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-import pytest
 
 from relay.monitor import Monitor
 from relay.notify import FakeNotifier

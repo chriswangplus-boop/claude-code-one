@@ -1,4 +1,3 @@
-import json
 
 from relay.redact import redact, redact_obj
 from relay.util import sha256_text

@@ -1,32 +1,40 @@
-# Revision status — Part A
+# Revision status — Relay v0.3+ (Parts A–C, reviews #2 and #3)
 
-## Session checkpoint (2026-10-21)
+## Session checkpoint (2026-10-22)
 
 - No Relay loop is running; there is nothing to pause.
-- Part A work is committed locally at `deepseek-relay-part-a` (first commit `23b7f0e`, remainder after it).
-- Patch: `reviews/deepseek-relay-part-a.patch` (applies to PR #5 `85072b9`).
-- Tests: **195 passed** (Python) and **24 passed** (`swift test`).
+- Review #3 repairs: branch `deepseek-relay-review-3`, base `dd3bd84` (the PR head after
+  `reviews/CLAUDE_REVIEW_3.md` and `REVISION_PLAN_3.md` landed). Nine commits: all eight findings
+  (R3-2/R3-4 and R3-3/R3-7 share a commit), the clock fix, and these docs.
+- Patch for Claude: `reviews/deepseek-relay-review-3.patch` (applies to `dd3bd84`).
+- Tests: **223 passed** (Python), **24 passed** (`swift test`), `pyflakes` clean.
 - Resume from the workspace root file `CONTINUE_HERE.md`.
-- Remaining: push the branch (no credential on this Mac), the real-app calibration checks, and the
-  full 30-minute Activity Monitor energy reading.
+- Remaining: the human uploads the branch; real-app calibration and a toy-project trial on macOS 27.2 (now including the R3-7 supervisor-permission check), live DeepSeek/ntfy
+  checks, and the Activity Monitor energy reading.
+- Part 1 of `REVISION_PLAN_3.md` is complete. Part 2 (Codex as a second supervisor), Part 3
+  (manual switching) and Part 4 (Codex model/effort) have not been started.
 
-Base: `plugins/deepseek-relay` at PR #5 head `85072b9` (code + `CLAUDE_REVIEW.md` + `REVISION_PLAN.md`).
+Base: PR #5 head `dd3bd84` (round 1 + review #2 fixes applied as v0.3 + `reviews/CLAUDE_REVIEW_3.md`,
+`CODEX_PLAN.md`, `REVISION_PLAN_3.md`).
 
-`pytest`: **195 passed** on macOS. `swift test`: **24 passed** in `apps/RelayWatch`. This file is
-a handoff, not a substitute for the review tests.
+`pytest`: **223 passed** on macOS 27.2 arm64 / Python 3.14.3. `swift test`: **24 passed** in
+`apps/RelayWatch`. `python3 -m pyflakes relay tests` reports nothing. This file is a handoff, not
+a substitute for the review tests.
 
 ## Fixed with regression tests
 
-- **P1-1** one-time decision codes: generated per decision, stored only as a SHA-256 in `STATE.json`,
-  shown only in the desktop notification/terminal, required by `relay decide --code` and the
-  `ANSWER:` line. `relay instruct` requires a human TTY/dialog confirmation. Agent-forged answers
-  are rejected; tests cover wrong/empty codes.
+- **P1-1** one-time decision codes: generated per decision; only the SHA-256 hashes are stored, in
+  the external trust folder (never in `STATE.json`), shown only in the desktop notification and
+  terminal, required by `relay decide --code` and the `ANSWER:` line. Review #2 N1 hardened this
+  further with signed journals and a dialog-only `relay instruct`. Agent-forged answers are
+  rejected; tests cover wrong/empty codes and the review's three bypass paths.
 - **P1-2** control files are now in the turn snapshot. `STATE.json`, `BATON.json`, flags,
   `monitor/`, `answers/`, `calibration/`, `MONITOR_NOTES.md` need matching journal evidence;
   otherwise they are ownership violations. Tests cover each control file.
 - **P1-3** popup policy uses anchored whole-command patterns, rejects shell metacharacters, and
-  clicks buttons by Accessibility label. Vision-supplied coordinates are ignored. Tests include
-  the three review exploits plus redirection/newlines; the driver test proves no coordinate click.
+  clicks buttons by Accessibility label. Vision-supplied coordinates are ignored. Review #2 N6
+  also reads the dialog text through Accessibility and rejects risky arguments
+  (`--output`/`--no-verify`/`-p`/absolute paths/...); `git add`/`commit` are never auto-approved.
 - **P1-4** `relay resume --clear-halt` journals `human.halt_cleared`; monitor history checks start
   after that watermark. Halt dedupe is event-ID based. Test: violation → halt → clear → no halt →
   new violation → halt.
@@ -37,8 +45,9 @@ a handoff, not a substitute for the review tests.
   asserts the next phase is kept and the round is not duplicated.
 - **P2-7** resume without a sentinel always calls `_ensure_session`; test crashes in REVIEW and
   verifies a new reviewer chat is opened.
-- **P2-8** switching Claude roles checkpoints the outgoing role first; the e2e run now has three
-  role-switch checkpoints.
+- **P2-8** switching Claude roles checkpoints the outgoing planner/reviewer first; the e2e run has
+  two role-switch checkpoints. Review #2 N5 excludes `strategist`/`fixer` from checkpointing (they
+  always get a fresh chat), so no uncounted Opus turn runs.
 - **P2-9** aborted turns record blocked paths/hashes and do not advance the round; resume refuses
   until the unsafe write is resolved. Test asserts no commit of the violating file.
 - **P2-10** every state writer reloads under the lock: `_route`, `_ensure_session`,
@@ -173,3 +182,55 @@ not the Relay loop, and can steal focus. It is the P1-1 anti-injection gate. Tes
 it (`PYTEST_CURRENT_TEST` guard + monkeypatch). It can be disabled explicitly with
 `security.require_instruction_confirmation=false`; that lets any shell-capable agent record a
 human-labelled instruction, so it is a deliberate security downgrade.
+
+## Review #3 (done) — base `dd3bd84`
+
+`CLAUDE_REVIEW_3.md` returned FIX-FIRST with six findings (plus two small ones). All eight are
+fixed in `REVISION_PLAN_3.md` Part 1 order, each with a regression test that fails before the fix.
+Commits are separate per finding (except R3-2/R3-4, which share the trust file).
+
+- **R3-5 (git filters).** Every git call now refuses while `.git/config` (or an `include.path` it
+  pulls in) defines `filter.*.clean/smudge/process`, `diff.*.textconv/command`, `merge.*.driver`,
+  `core.fsmonitor/sshCommand/gitProxy/askpass` or a non-allowlisted credential helper, or while
+  `.gitattributes` / `.git/info/attributes` select a non-allowlisted `filter=`/`diff=`/`merge=`
+  driver. git-lfs and the standard credential helpers are allowlisted. The git-control comparison
+  also runs before the checkpoint, rollover and `FIX_PLAN` archive commits, not only at turn end.
+  Tests: the review's clean-filter probe through all four commit paths, an included config,
+  fsmonitor refusal, and the attribute-only case; the filter never runs.
+- **R3-1 (journal evidence).** `trusted_events()` re-hashes each body, checks the chain, signature,
+  event-id order and duplicates, and counts only events after a fixed migration anchor. A moving
+  tip outside the project catches truncation (the old single anchor moved with every append, so
+  the signature regime covered nothing). Ownership, decision acceptance and halt clearing call
+  `verify()` first and pause on failure. Test: a genuine signed event copied with a new body and
+  the old `hash`/`sig` produces no trusted evidence, no commit, and a pause.
+- **R3-7 (code on screen).** The one-time code is never in the desktop notification and never on
+  an `osascript` command line. It goes to ntfy only when an access token is configured, or to an
+  interactive terminal; every `decision.asked` records `code_delivery`. `relay start` refuses when
+  a configured supervisor bundle id holds Screen Recording or Accessibility
+  (`security.supervisor_bundle_ids`, probed against the user TCC database). Tests: the desktop
+  body, the osascript argv, the withheld case, and the start guard.
+- **R3-2 (answer binding).** `escalate_human` writes a signed decision record (question hash,
+  options, kind, data, return_to, round, code hash) in the trust folder; accepting an answer reads
+  only that record, checks the question hash and a persisted `WAIT_HUMAN` fingerprint, and clears
+  it once used. Editing `STATE.json`/`PENDING_DECISION.md` while stopped is refused. Tests:
+  edit-while-stopped, restart, missing record, no plaintext code.
+- **R3-4 (baselines).** File and git-control baselines are signed and stored per attempt before
+  the pointer is typed, and reused on resume, checkpoint and rollover. A pending turn with no
+  baseline pauses; `relay resume --adopt-baseline` records the human's explicit reconciliation.
+  `STATE.json`/`BATON.json` are excluded because Relay rewrites them on every start (covered by
+  the signed journal). Test: the coder overwrites `.relay/PLAN.md`, Relay crashes, resume still
+  finds the violation.
+- **R3-3 (crash).** `_apply_human_opus_request` loaded `state` only after reading it, so a "Use
+  Opus" answer raised `NameError`. Fixed; `pyflakes` is now part of the dev dependencies and the
+  test run.
+- **R3-6 (option values).** `git status/diff` and `pytest` have a per-command option allowlist;
+  `--opt=value` and `--opt value` values pass the same path rules. `pytest --confcutdir=../..` and
+  friends go to the human.
+- **R3-8 (countable requests).** Every task, seed, nudge, retry and checkpoint ring journals
+  `app.request` with backend, role, kind, model, effort, chars, attempt id and send result.
+  `docs/EVENTS.md` documents it; the committed Swift fixture was regenerated.
+
+Not addressed here (Part 2+ of `REVISION_PLAN_3.md`): Codex as a second supervisor
+(`supervisor.backend`, `CODEX_DONE.json`, calibration), `relay switch --to codex|claude`, and the
+Codex model/effort policy (`gpt-6.1-sol`, GPT Routing v3.0 bundle, High qualification). The Codex
+files are not bundled yet because they live on the human's Mac (`~/.codex/routing-policy.json`).

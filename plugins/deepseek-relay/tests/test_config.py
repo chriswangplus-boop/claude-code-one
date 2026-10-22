@@ -3,7 +3,6 @@ import json
 import pytest
 
 from relay.config import (
-    Config,
     ensure_usable_project,
     get_secret,
     load_config,

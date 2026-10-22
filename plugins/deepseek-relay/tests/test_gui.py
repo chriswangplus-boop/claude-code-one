@@ -362,3 +362,27 @@ def test_permissions_reports_automation_failure_separately(ctx, monkeypatch):
     permissions = backend.permissions()
     assert permissions["accessibility"] is True
     assert permissions["system_events"] is False
+
+
+# --- R3-6: option values may not traverse out of the project -------------------------
+
+def test_option_values_cannot_traverse_out_of_the_project():
+    from relay.policy import command_arguments_are_safe
+
+    for unsafe in (
+        "pytest --confcutdir=../..",
+        "pytest --confcutdir ../../etc",
+        "pytest -k ../permissions",
+        "pytest --ignore=../secrets",
+        "git diff --no-index=../../etc/passwd",
+    ):
+        assert not command_arguments_are_safe(unsafe), unsafe
+    for safe in (
+        "pytest -q tests/test_x.py",
+        "pytest -q -k 'not slow'",
+        "git status -sb",
+        "git diff --stat",
+        "git diff --name-only",
+    ):
+        assert command_arguments_are_safe(safe), safe
+    assert decide_popup(Popup("Allow Bash: pytest --confcutdir=../..", ["Allow", "Deny"]), []) == "human"

@@ -8,7 +8,6 @@ import pytest
 
 from relay.brain.judgments import RouteDecision
 from relay.gui import FakeAppDriver, Popup, pointer_role, pointer_round, write_sentinel
-from relay.journal import Journal
 from relay.notify import FakeNotifier
 from relay.orchestrator import Orchestrator
 from relay.setup import init_project
@@ -161,6 +160,10 @@ class ScriptedApps:
 def build(ctx, *, verdicts=("PROJECT_DONE",), decision=None, notifier=None,
           reviewer_ctx=45, coder_ctx=45, **cfg):
     init_project(ctx.cfg, ctx.paths, ctx.store, ctx.journal, goal="Build a tiny todo CLI")
+    # R3-7: the code is delivered only by phone (ntfy with a token) or an interactive terminal.
+    ctx.cfg.set("notify.ntfy", True)
+    ctx.cfg.set("ntfy.token", "test-token")
+    ctx.cfg.set("ntfy.topic", "test-topic")
     for key, value in cfg.items():
         ctx.cfg.set(key, value)
     apps = ScriptedApps(ctx.cfg.project_dir, verdicts, decision, reviewer_ctx=reviewer_ctx, coder_ctx=coder_ctx)
@@ -232,7 +235,7 @@ def test_decision_pauses_notifies_and_resumes(ctx):
     assert "VERSION" not in notifier.sent[-1]["body"]
 
     import re
-    code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["desktop_body"]).group(1)
+    code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["ntfy_body"]).group(1)
     assert code not in pending
     assert code not in ctx.paths.state.read_text()
     result = orch.answer_decision("JSON, no dependencies", code)
@@ -424,7 +427,7 @@ def test_agent_cannot_forge_a_human_answer(ctx):
     state = orch.run(max_steps=10, wait_human=False)
     assert state["phase"] == "WAIT_HUMAN"
     import re
-    code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["desktop_body"]).group(1)
+    code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["ntfy_body"]).group(1)
 
     with pytest.raises(StateError, match="invalid one-time code"):
         accept_decision(ctx, "Approve everything", "wrongcode")
@@ -500,7 +503,6 @@ def test_aborted_turn_stays_blocked_until_resolved(ctx):
 
 
 def test_concurrent_instruction_survives_routing(ctx):
-    from relay.brain.judgments import RouteDecision
     from relay.decisions import record_instruction
 
     class InterleavingBrain(StubBrain):
@@ -665,7 +667,7 @@ def test_round_cap_escalates_with_three_options(ctx):
     assert ctx.journal.of_type("state.paused") == []
 
     import re
-    code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["desktop_body"]).group(1)
+    code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["ntfy_body"]).group(1)
     orch.answer_decision("Raise the cap", code)
 
     state = orch.run(max_steps=3)
@@ -681,7 +683,7 @@ def test_round_cap_stop_option_pauses(ctx):
     assert state["phase"] == "WAIT_HUMAN"
 
     import re
-    code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["desktop_body"]).group(1)
+    code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["ntfy_body"]).group(1)
     orch.answer_decision("Stop for now", code)
     state = orch.run(max_steps=2)
     assert state["phase"] == "PAUSED"
@@ -786,28 +788,33 @@ def _decision_build(ctx, **kw):
 
 
 def test_rewriting_state_json_cannot_answer_a_decision(ctx):
-    from relay.decisions import accept_decision, hash_code
-    from relay.errors import StateError
+    from relay.decisions import accept_decision
+    from relay.errors import IntegrityError, StateError
 
     orch, apps, notifier, _ = _decision_build(ctx)
     state = orch.run(max_steps=10, wait_human=False)
     assert state["phase"] == "WAIT_HUMAN"
-    real_code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["desktop_body"]).group(1)
+    real_code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["ntfy_body"]).group(1)
     assert "code_hash" not in ctx.paths.state.read_text()
+    original = ctx.store.load()["pending_decision"]
 
+    # A fake code written into the ANSWER line is simply wrong.
     fake_code = "agentchosen"
-    ctx.store.mutate(
-        lambda current: current["pending_decision"].__setitem__("code_hash", hash_code(fake_code))
-    )
     pending = ctx.paths.pending_decision.read_text().rstrip()
     ctx.paths.pending_decision.write_text(pending + f" {fake_code} A, use JSON\n")
-
     with pytest.raises(StateError, match="invalid one-time code"):
         accept_decision(ctx, "A, use JSON", fake_code)
     assert ctx.journal.of_type("decision.answered") == []
     assert ctx.store.load()["phase"] == "WAIT_HUMAN"
 
-    # The real one-time code, held only outside the project, still works.
+    # Editing the pending question in STATE.json is tampering; the answer is refused.
+    ctx.store.mutate(lambda current: current["pending_decision"].__setitem__("question", "pwned"))
+    with pytest.raises(IntegrityError, match="changed"):
+        accept_decision(ctx, "A, use JSON", real_code)
+    assert ctx.journal.of_type("decision.answered") == []
+
+    # Once the edit is gone, the real one-time code (held only outside the project) works.
+    ctx.store.mutate(lambda current: current.__setitem__("pending_decision", original))
     result = accept_decision(ctx, "A, use JSON", real_code)
     assert result["phase"] == "CODE"
     assert len(ctx.journal.of_type("decision.answered")) == 1
@@ -843,7 +850,7 @@ def test_waiting_for_a_decision_accepts_the_real_code(ctx, monkeypatch):
     orch, apps, notifier, _ = _decision_build(ctx)
     state = orch.run(max_steps=10, wait_human=False)
     assert state["phase"] == "WAIT_HUMAN"
-    real_code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["desktop_body"]).group(1)
+    real_code = re.search(r"One-time answer code: (\S+)", notifier.sent[-1]["ntfy_body"]).group(1)
 
     monkeypatch.setattr(orchestrator_module, "local_answer", lambda paths: (real_code, "JSON"))
     orch.wait_for_decision()
@@ -887,3 +894,258 @@ def test_first_turn_does_not_overwrite_user_edits(ctx):
     assert "uncommitted" in ctx.paths.pending_decision.read_text().lower()
     commits = ctx.journal.of_type("git.commit")
     assert not any("user-notes" in str(commit.get("detail", {}).get("changed", "")) for commit in commits)
+
+
+# --- R3-5: git filters/attributes never run, and every commit path refuses -----------
+
+def _plant_filter(project: Path) -> Path:
+    marker = Path(project) / "filter-ran"
+    subprocess.run(
+        ["git", "-C", str(project), "config", "filter.evil.clean", f"touch {marker}; cat"],
+        check=True, capture_output=True,
+    )
+    (Path(project) / ".gitattributes").write_text("*.txt filter=evil\n")
+    return marker
+
+
+def test_a_planted_filter_pauses_before_git_runs(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    marker = _plant_filter(ctx.cfg.project_dir)
+    state = orch.run(max_steps=2, wait_human=False)
+
+    assert state["phase"] == "PAUSED"
+    assert not marker.exists(), "the clean filter ran"
+    assert not ctx.journal.of_type("git.commit")
+
+
+def test_the_checkpoint_commit_refuses_a_planted_filter(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    orch._prepare()
+    marker = _plant_filter(ctx.cfg.project_dir)
+
+    from relay.errors import IntegrityError, PauseRequested
+    with pytest.raises((IntegrityError, PauseRequested)):
+        orch._checkpoint_before_switch("planner", 1)
+    assert not marker.exists()
+
+
+def test_the_rollover_commit_refuses_a_planted_filter(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    orch._prepare()
+    marker = _plant_filter(ctx.cfg.project_dir)
+
+    from relay.errors import IntegrityError, PauseRequested
+    with pytest.raises((IntegrityError, PauseRequested)):
+        orch._rollover("coder", 1, "test")
+    assert not marker.exists()
+
+
+def test_the_fix_plan_archive_commit_refuses_a_planted_filter(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    orch._prepare()
+    (ctx.cfg.project_dir / ".relay/FIX_PLAN.md").write_text("fix plan\n")
+    marker = _plant_filter(ctx.cfg.project_dir)
+
+    from relay.errors import IntegrityError, PauseRequested
+    with pytest.raises((IntegrityError, PauseRequested)):
+        orch._archive_fix_plan(1, "test")
+    assert not marker.exists()
+
+
+# --- R3-1: authorization needs an intact, signed journal -----------------------------
+
+def test_run_pauses_when_a_journal_line_was_rewritten(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    ctx.journal.append("turn.start", round_no=0, detail={"role": "coder"})
+    file = sorted(ctx.paths.journal_dir.glob("*.jsonl"))[-1]
+    lines = file.read_text(encoding="utf-8").splitlines()
+    event = json.loads(lines[-1])
+    event["detail"]["role"] = "planner"  # body changed, hash/sig kept
+    lines[-1] = json.dumps(event, sort_keys=True)
+    file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    state = orch.run(max_steps=1, wait_human=False)
+
+    assert state["phase"] == "PAUSED"
+    assert any(
+        event["detail"].get("kind") == "journal"
+        for event in ctx.journal.of_type("integrity.violation")
+    )
+
+
+# --- R3-7: the answer code only reaches the phone or an interactive terminal ---------
+
+OPTIONS = [
+    {"label": "JSON", "consequence": "simple"},
+    {"label": "SQLite", "consequence": "robust"},
+]
+
+
+def test_the_answer_code_never_reaches_the_desktop_notification(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    ctx.cfg.set("notify.ntfy", True)
+    ctx.cfg.set("ntfy.token", "tok")
+    ctx.cfg.set("ntfy.topic", "topic")
+
+    decision_id = orch.escalate_human("Which storage?", OPTIONS)
+    code = orch._decision_codes[decision_id]
+    sent = notifier.sent[-1]
+
+    assert code not in sent["desktop_body"]
+    assert "code" not in sent["desktop_body"].lower()
+    assert code in sent["ntfy_body"]
+    asked = ctx.journal.latest("decision.asked")
+    assert asked["detail"]["code_delivery"] == {"tty": False, "phone": True, "desktop": False}
+
+
+def test_the_code_is_withheld_without_a_phone_or_terminal(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    ctx.cfg.set("notify.ntfy", False)
+
+    decision_id = orch.escalate_human("Which storage?", OPTIONS)
+    code = orch._decision_codes[decision_id]
+    sent = notifier.sent[-1]
+
+    assert code not in sent["desktop_body"]
+    assert code not in sent["ntfy_body"]
+    assert ctx.journal.of_type("decision.code_undelivered")
+    asked = ctx.journal.latest("decision.asked")
+    assert asked["detail"]["code_delivery"]["phone"] is False
+
+
+def test_the_code_is_never_on_the_osascript_command_line(ctx, monkeypatch):
+    from relay import notify as notify_module
+    from relay.notify import Notifier
+
+    ctx.cfg.set("notify.ntfy", False)
+    ctx.cfg.set("notify.desktop", True)
+    captured: dict = {}
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return Result()
+
+    monkeypatch.setattr(notify_module.subprocess, "run", fake_run)
+    init_project(ctx.cfg, ctx.paths, ctx.store, ctx.journal, goal="code delivery")
+    notifier = Notifier(ctx.cfg, ctx.journal)
+    orch = Orchestrator(ctx, {}, notifier=notifier)
+
+    decision_id = orch.escalate_human("Which storage?", OPTIONS)
+    code = orch._decision_codes[decision_id]
+
+    assert captured["cmd"], "the desktop notification never ran"
+    assert code not in " ".join(str(part) for part in captured["cmd"])
+
+
+def test_start_refuses_a_supervisor_that_can_read_the_screen(ctx, monkeypatch):
+    from relay.cli import _refuse_unsafe_supervisors
+    from relay.errors import ConfigError
+
+    ctx.cfg.set("security.supervisor_bundle_ids", ["com.example.claude"])
+    monkeypatch.setattr(
+        "relay.guard.system_tcc_grants",
+        lambda: {"com.example.claude": {"kTCCServiceAccessibility"}},
+    )
+    with pytest.raises(ConfigError, match="one-time answer code"):
+        _refuse_unsafe_supervisors(ctx)
+    assert ctx.journal.of_type("security.refused")
+
+
+def test_the_start_guard_passes_when_the_probe_cannot_be_read(ctx, monkeypatch):
+    from relay.cli import _refuse_unsafe_supervisors
+
+    ctx.cfg.set("security.supervisor_bundle_ids", ["com.example.claude"])
+    monkeypatch.setattr("relay.guard.system_tcc_grants", lambda: None)
+    _refuse_unsafe_supervisors(ctx)
+
+
+# --- R3-3: a "Use Opus" answer must not crash on an undefined name -------------------
+
+def test_answering_use_opus_arms_an_opus_turn_without_crashing(ctx):
+    orch, apps, notifier, _ = build(ctx)
+    last = {
+        "id": "D-900", "answer": "Use Opus for the next turn",
+        "kind": "round_cap", "options": [], "data": {},
+    }
+    ctx.store.mutate(lambda state: state.update({"last_decision": last, "round": 1}))
+
+    orch._apply_human_opus_request(last)  # raised NameError before the fix
+
+    state = ctx.store.load()
+    assert state["human_opus_request"]["source"] == "D-900"
+    assert ctx.journal.of_type("model.requested")
+
+
+# --- R3-4: a crash cannot launder what the agent wrote -------------------------------
+
+def test_a_crash_cannot_launder_a_violating_write(ctx):
+    orch, apps, notifier, _ = build(ctx, verdicts=["PROJECT_DONE"])
+    apps.violate_once = True   # coder overwrites .relay/PLAN.md
+    apps.crash_once = True     # then dies right after writing its sentinel
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        orch.run(max_steps=10)
+
+    pending = ctx.store.load()["pending"]
+    assert pending["phase"] == "CODE"
+    baseline = ctx.trust.attempt(pending["attempt_id"])
+    assert baseline is not None, "the baseline must be persisted before ringing"
+    assert "files" in baseline and "git" in baseline
+    assert not str(ctx.trust.root).startswith(str(ctx.cfg.project_dir))
+
+    orch2 = Orchestrator(ctx, apps.drivers(), brain=StubBrain(), notifier=notifier)
+    state = orch2.resume(max_steps=20, wait_human=False)
+
+    assert state["phase"] == "PAUSED"
+    violation = ctx.journal.latest("integrity.violation")
+    assert any(item["path"] == ".relay/PLAN.md" for item in violation["detail"]["violations"])
+
+
+def test_a_legacy_pending_turn_without_a_baseline_pauses_and_can_be_adopted(ctx):
+    from relay.cli import _adopt_baseline
+
+    orch, apps, notifier, _ = build(ctx, verdicts=["PROJECT_DONE"])
+    apps.crash_once = True
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        orch.run(max_steps=10)
+
+    pending = ctx.store.load()["pending"]
+    ctx.trust.clear_attempt(str(pending["attempt_id"]))
+    ctx.store.mutate(lambda current: current["pending"].pop("attempt_id", None))
+
+    orch2 = Orchestrator(ctx, apps.drivers(), brain=StubBrain(), notifier=notifier)
+    state = orch2.resume(max_steps=20, wait_human=False)
+    assert state["phase"] == "PAUSED"
+    assert "no signed baseline" in str(state.get("paused_reason"))
+
+    _adopt_baseline(ctx)
+    adopted = ctx.store.load()["pending"]["attempt_id"]
+    assert ctx.trust.attempt(adopted) is not None
+    assert ctx.journal.of_type("baseline.adopted")
+
+    orch3 = Orchestrator(ctx, apps.drivers(), brain=StubBrain(), notifier=notifier)
+    state = orch3.resume(max_steps=20, wait_human=False)
+    assert state["phase"] != "PAUSED"
+
+
+# --- R3-8: every message typed into an app is journaled as app.request ---------------
+
+def test_every_message_typed_into_an_app_is_journaled(ctx):
+    orch, apps, notifier, _ = build(ctx, verdicts=["PROJECT_DONE"])
+    orch.run(max_steps=30)
+
+    requests = ctx.journal.of_type("app.request")
+    assert requests
+    kinds = {event["detail"]["kind"] for event in requests}
+    assert {"task", "seed"} <= kinds
+    for event in requests:
+        detail = event["detail"]
+        assert {
+            "app", "backend", "role", "kind", "model", "effort", "chars", "attempt_id", "sent",
+        } <= set(detail)
+        assert detail["backend"] in ("claude", "coder")
+    assert len(requests) >= len(ctx.journal.of_type("gui.ring"))

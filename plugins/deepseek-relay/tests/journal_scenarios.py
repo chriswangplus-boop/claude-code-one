@@ -11,15 +11,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
 from relay.brain.judgments import RouteDecision
-from relay.cli import main as cli_main
 from relay.context import open_project
 from relay.decisions import record_instruction
-from relay.gui import FakeAppDriver, Popup, pointer_role, pointer_round, write_sentinel
+from relay.gui import FakeAppDriver, pointer_role, pointer_round, write_sentinel
 from relay.monitor import Monitor
-from relay.notify import FakeNotifier
+from relay.notify import FakeNotifier, Notifier
 from relay.orchestrator import Orchestrator
 from relay.setup import init_project
 
@@ -210,6 +208,9 @@ def build_journal(root: str | Path) -> list[dict]:
     ctx.cfg.set("nudge_after_seconds", 100000)
     ctx.cfg.set("max_rounds_per_milestone", 80)
     ctx.cfg.set("max_total_rounds", 400)
+    ctx.cfg.set("notify.ntfy", True)
+    ctx.cfg.set("ntfy.token", "fixture-token")
+    ctx.cfg.set("ntfy.topic", "fixture-topic")
 
     apps = FixtureApps(root, ctx)
     notifier = FakeNotifier()
@@ -220,7 +221,7 @@ def build_journal(root: str | Path) -> list[dict]:
     import re
     code = None
     for sent in reversed(notifier.sent):
-        match = re.search(r"One-time answer code: (\S+)", str(sent.get("desktop_body") or ""))
+        match = re.search(r"One-time answer code: (\S+)", str(sent.get("ntfy_body") or ""))
         if match:
             code = match.group(1)
             break
@@ -246,7 +247,7 @@ def build_journal(root: str | Path) -> list[dict]:
         answer = labels[0] if labels else "Continue"
         latest = None
         for sent in reversed(notifier.sent):
-            match = re.search(r"One-time answer code: (\S+)", str(sent.get("desktop_body") or ""))
+            match = re.search(r"One-time answer code: (\S+)", str(sent.get("ntfy_body") or ""))
             if match:
                 latest = match.group(1)
                 break
@@ -258,10 +259,24 @@ def build_journal(root: str | Path) -> list[dict]:
     # 3. The monitor sees the historical violation and halts, leaving notes.
     Monitor(ctx, brain=None, notifier=FakeNotifier()).check_once()
 
-    # 4. Real CLI paths for the flags and the host guard.
-    cli_main(["pause", "--project", str(root), "--reason", "fixture pause"])
-    cli_main(["stop", "--project", str(root), "--reason", "fixture stop"])
-    cli_main(["host-guard", "--project", str(root), "--pct", "99"])
+    # 4. The human pause/stop and host guard, written in-process with the fixture clock.
+    #    The CLI opens the project with the wall clock, which made the committed fixture depend
+    #    on the day it was regenerated (and could interleave a later day file).
+    ctx.store.set_flag("pause", {"reason": "fixture pause", "by": "human"})
+    ctx.journal.append("human.pause", actor="human", detail={"reason": "fixture pause"})
+    ctx.store.set_flag("stop", {"reason": "fixture stop", "by": "human"})
+    ctx.journal.append("human.stop", actor="human", detail={"reason": "fixture stop"})
+    guard = float(ctx.cfg.get("host.context_guard", 0.7)) * 100
+    ctx.store.set_flag("pause", {"reason": "host context guard", "by": "host-guard"})
+    ctx.journal.append(
+        "guard.tripped",
+        detail={"kind": "host_context", "pct": 99.0, "turns": 3, "limit": guard},
+        result="blocked",
+    )
+    Notifier(
+        ctx.cfg, ctx.journal,
+        desktop_fn=lambda *args: True, ntfy_fn=lambda *args: True,
+    ).send("Relay paused: host context guard", "host DeepSeek session at 99%.", urgent=True)
     ctx.store.clear_flag("pause")
     ctx.store.clear_flag("stop")
 
