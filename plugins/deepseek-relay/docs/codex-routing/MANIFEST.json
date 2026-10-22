@@ -1,0 +1,21 @@
+{
+  "allowed_efforts": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "copied_at": "2026-10-22",
+  "default_effort": "medium",
+  "files": {
+    "AGENTS.md": "787850e9bcfb83a35b7965273e8f3a24b16dfde65f7fd07499c50dc9c4876657",
+    "model-routing-strategy-v3.0.md": "ede35efb904c65959389488fecbf7c1898d5547428a5ca0a1caa09b3797254a2",
+    "routing-policy.json": "3ab275d6c46dcf12d473903b9d8f1b4c642298c40a7d6572d0e15960cdadfd73"
+  },
+  "model": "gpt-6.1-sol",
+  "note": "Relay refuses to run Codex as supervisor when a file is missing or a hash differs; it never falls back to Claude routing.",
+  "platform": "codex",
+  "policy": "gpt-routing",
+  "released": "2026-10-21",
+  "source": "~/.codex",
+  "version": "3.0.0"
+}

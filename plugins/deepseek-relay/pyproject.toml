@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepseek-relay"
+version = "0.1.1"
+description = "GUI-level relay between the Claude Code app and the Zcode app, run by a stateless DeepSeek brain."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+keyring = ["keyring>=24"]
+dev = ["pytest>=8", "pyflakes>=3.2"]
+
+[project.scripts]
+relay = "relay.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["relay*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

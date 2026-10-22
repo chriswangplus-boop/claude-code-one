@@ -1,0 +1,115 @@
+{
+  "schema": 1,
+  "project_dir": ".",
+  "claude_app": {
+    "max_rounds_per_session": 4,
+    "timeout_minutes": 30
+  },
+  "model_policy": {
+    "default": {
+      "model": "Sonnet 5.5",
+      "effort": "high"
+    },
+    "escalated": {
+      "model": "Opus 5.5",
+      "effort": "medium"
+    },
+    "escalate_on_first_plan": true,
+    "fix_plan_after": 2,
+    "opus_fix_after": 4,
+    "fixer_max_files": 10,
+    "max_opus_turns_per_milestone": 1,
+    "max_opus_turns_per_day": 3
+  },
+  "zcode_app": {
+    "model": "GLM 5.3 flash",
+    "effort": "high",
+    "max_rounds_per_session": 3,
+    "timeout_minutes": 60
+  },
+  "rollover_threshold": 0.7,
+  "rollover_at_milestone_pct": 0.5,
+  "deepseek": {
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-flash",
+    "context_window": 1000000,
+    "vision": true,
+    "context_guard": 0.7,
+    "text_only_mode": false,
+    "timeout_seconds": 90,
+    "max_retries": 2,
+    "temperature": 0,
+    "price_input_per_mtok": 0.3,
+    "price_output_per_mtok": 1.2,
+    "thinking": "disabled",
+    "max_output_tokens": 2000
+  },
+  "monitor": {
+    "enabled": true,
+    "interval_minutes": 10,
+    "model": null,
+    "layer2": true,
+    "heartbeat_stale_seconds": 300
+  },
+  "poll_seconds": 25,
+  "screen_check_seconds": 60,
+  "user_idle_seconds": 30,
+  "decision_poll_seconds": 60,
+  "decision_reminder_hours": 4,
+  "max_rounds_per_milestone": 8,
+  "max_total_rounds": 60,
+  "daily_budget_usd": 20,
+  "max_rejected_sentinels": 3,
+  "max_nudges": 1,
+  "popup_allow_list": [
+    "^allow .* to read (?:a )?file(?: .*)?\\??$",
+    "^allow .* to edit (?:a )?file in (?:the )?project(?: .*)?\\??$",
+    "^run (?:the )?tests?(?: .*)?\\??$",
+    "^allow git (status|diff)(?: .*)?\\??$"
+  ],
+  "screenshot_retention_days": 14,
+  "ntfy": {
+    "server": "https://ntfy.sh",
+    "topic": null,
+    "phone_reply": false,
+    "token": null
+  },
+  "notify": {
+    "desktop": true,
+    "ntfy": true
+  },
+  "auto_commit": true,
+  "git": {
+    "enabled": true
+  },
+  "gui": {
+    "enabled": true,
+    "backend": "macos",
+    "corner_failsafe": true,
+    "typing_delay_ms": 12,
+    "max_recovery_actions": 6
+  },
+  "host": {
+    "context_guard": 0.7,
+    "max_turns": 40
+  },
+  "nudge_after_seconds": 180,
+  "decision_wait_timeout_minutes": 0,
+  "security": {
+    "allow_google_drive": true,
+    "require_instruction_confirmation": true,
+    "supervisor_bundle_ids": []
+  },
+  "popup_allow_commands": [
+    "^git (status|diff)(?: [^;&|`$<>\\n]*)?$",
+    "^(?:pytest|python3? -m pytest)(?: [^;&|`$<>\\n]*)?$"
+  ],
+  "supervisor": {
+    "backend": "claude"
+  },
+  "codex_app": {
+    "model": "gpt-6.1-sol",
+    "effort": "medium",
+    "timeout_minutes": 30
+  }
+}
