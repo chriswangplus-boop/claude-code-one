@@ -183,6 +183,44 @@ it (`PYTEST_CURRENT_TEST` guard + monkeypatch). It can be disabled explicitly wi
 `security.require_instruction_confirmation=false`; that lets any shell-capable agent record a
 human-labelled instruction, so it is a deliberate security downgrade.
 
+## Review #4 (done) — base `3643c6e`
+
+- **R4-1** `relay resume --clear-halt`, `--adopt-baseline` and the new `--accept-git-control`
+  need a one-time code (phone with token, or TTY), stored only as a hash in the trust folder and
+  used once. A static test fails if a new `actor="human"` write is added without proof
+  (`pause`/`stop` are exempt). Tests cover no code, wrong code, one-use, and the "separately"
+  rule.
+- **R4-2** the lfs driver is allowed only with the exact standard git-lfs commands; a signed
+  last-known-good snapshot of the git control files lives in the trust folder and is compared
+  before every git call, so between-turn edits pause. `--accept-git-control` re-baselines after
+  a human code.
+- **R4-3** every `.gitattributes` in the tree (all depths) is scanned and snapshotted.
+- **R4-4** a tampered decision is cleared, kept as `decision.tamper`, and re-asked with a new id,
+  record and code — including after a restart; the refusal names `relay resume`.
+- Calibration prints the iPhone notification-mirroring check; OPERATIONS documents it.
+
+## Part 2 (started) — base `ae3d7fa`
+
+Codex desktop is selectable as the supervisor; the coder stays Zcode.
+
+- `supervisor.backend` (`claude` default, `codex`) with a validated backend module.
+- Sentinel and rules names follow the backend: `.relay/CODEX_DONE.json`, `RULES_CODEX.md`.
+- `relay calibrate --app codex` and `make_codex_driver` reuse the calibration-driven GUI driver;
+  `relay start` requires the selected supervisor's proof plus Zcode, both resolving to the
+  project folder.
+- A pending turn pins its backend; a sentinel carrying another backend (or a resume on another
+  backend) is refused. Sentinels may carry `"backend"` and are checked when present.
+- `docs/codex-routing/` contains the bundled GPT Routing v3.0 policy (`AGENTS.md`,
+  `model-routing-strategy-v3.0.md`, `routing-policy.json`) with a sha256 `MANIFEST.json`.
+  `relay start` refuses Codex when a file is missing or modified and never falls back to Claude.
+- `codex_app.model` is pinned to `gpt-6.1-sol`, effort `medium`; model/effort still go through
+  `select_model` and are journaled as verified/unverifiable.
+
+Remaining for Part 2/4: per-backend/role session counters and context, an `attempt_id` field in
+the sentinel (backend is pinned now), the Codex High qualification assessment and its
+`HIGH_QUALIFICATION.json`, Codex's own computer-use check in calibration, and the real-app
+calibration on this Mac (process name may be "ChatGPT"; the default is a guess).
+
 ## Review #3 (done) — base `dd3bd84`
 
 `CLAUDE_REVIEW_3.md` returned FIX-FIRST with six findings (plus two small ones). All eight are

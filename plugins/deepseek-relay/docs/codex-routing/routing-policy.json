@@ -1,0 +1,134 @@
+{
+  "version": "3.0.0",
+  "released": "2026-10-21",
+  "platform": "codex",
+  "model": "gpt-6.1-sol",
+  "default_effort": "medium",
+  "allowed_efforts": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "apex_categories": [
+    "hardest problem solving",
+    "strategy",
+    "decision making",
+    "bug fixing",
+    "master-plan writing"
+  ],
+  "apex_requires": [
+    "authorized category",
+    "concrete difficulty or high-impact justification"
+  ],
+  "agents": {
+    "accessibility-specialist": {
+      "effort": "medium"
+    },
+    "autoresearch-orchestrator": {
+      "effort": "medium"
+    },
+    "code-reviewer": {
+      "effort": "medium"
+    },
+    "code-simplifier": {
+      "effort": "low"
+    },
+    "comment-analyzer": {
+      "effort": "low"
+    },
+    "documentation-specialist": {
+      "effort": "low"
+    },
+    "evaluator-codex": {
+      "effort": "medium"
+    },
+    "evaluator-gemini": {
+      "effort": "medium"
+    },
+    "evaluator-quality": {
+      "effort": "medium"
+    },
+    "evaluator-standard": {
+      "effort": "medium"
+    },
+    "evaluator-strict": {
+      "effort": "medium"
+    },
+    "evaluator": {
+      "effort": "medium"
+    },
+    "explorer-opus": {
+      "effort": "medium"
+    },
+    "explorer-sonnet": {
+      "effort": "low"
+    },
+    "generator": {
+      "effort": "low"
+    },
+    "implementer-opus": {
+      "effort": "medium"
+    },
+    "implementer-sonnet": {
+      "effort": "low"
+    },
+    "performance-engineer": {
+      "effort": "medium"
+    },
+    "pge-evaluator": {
+      "effort": "medium"
+    },
+    "pge-generator": {
+      "effort": "low"
+    },
+    "pge-orchestrator": {
+      "effort": "medium"
+    },
+    "pge-planner": {
+      "effort": "medium"
+    },
+    "planner": {
+      "effort": "medium"
+    },
+    "pr-code-reviewer": {
+      "effort": "medium"
+    },
+    "pr-test-analyzer": {
+      "effort": "medium"
+    },
+    "release-engineer": {
+      "effort": "medium"
+    },
+    "security-auditor": {
+      "effort": "medium"
+    },
+    "silent-failure-hunter": {
+      "effort": "medium"
+    },
+    "spec-analyst": {
+      "effort": "medium"
+    },
+    "strategist-opus": {
+      "effort": "medium"
+    },
+    "test-engineer": {
+      "effort": "medium"
+    },
+    "type-design-analyzer": {
+      "effort": "medium"
+    },
+    "verifier-opus": {
+      "effort": "medium"
+    },
+    "apex": {
+      "effort": "high",
+      "requires_apex_gate": true
+    }
+  },
+  "classification": {
+    "uncertain": "medium",
+    "low": "bounded mechanical work with clear specification and meaningful checks",
+    "high": "difficult/high-impact assignment within an authorized Apex category"
+  },
+  "evidence": "Configuration is not proof of execution. Missing task classification or effective execution evidence is unverified."
+}

@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from .clock import RealClock
 from .config import Config, load_config
+from .integrity import bind_trust
 from .journal import Journal
 from .paths import Paths
 from .state import FileLock, StateStore
@@ -39,6 +40,7 @@ def open_project(
     lock = FileLock(paths.lock, timeout=lock_timeout)
     store = StateStore(paths, clock=clock, lock=lock)
     trust = TrustStore(cfg.project_dir, env=env)
+    bind_trust(trust)
     journal = Journal(paths, lock=lock, clock=clock, trust=trust)
     return Context(
         cfg=cfg, paths=paths, lock=lock, clock=clock, store=store, journal=journal, trust=trust

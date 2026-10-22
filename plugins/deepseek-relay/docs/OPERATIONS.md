@@ -54,6 +54,10 @@ and never on a process command line, because a computer-use agent can read both.
 refuses when a supervisor bundle id in `security.supervisor_bundle_ids` holds Screen Recording or
 Accessibility; set that list to the apps Relay supervises.
 
+If macOS mirrors your iPhone notifications to the Mac (iPhone Mirroring / notification sharing),
+turn that off for the ntfy app: otherwise the phone-only code is shown on the Mac screen again.
+`relay calibrate` prints this check as part of its permission list.
+
 Answer with:
 
 ```bash
@@ -80,6 +84,28 @@ hole is closed. If you are driving Relay unattended and accept the risk, set
 `security.require_instruction_confirmation=false`; otherwise a shell-capable agent could record its
 own instruction. The dialog does not pause the loop, but it can steal focus, so avoid running it
 mid-turn.
+
+## Choosing the supervisor (Claude or Codex)
+
+`supervisor.backend` selects the app that takes the planner/reviewer/strategist/fixer roles; the
+coder stays in Zcode. Default is `claude`.
+
+```bash
+# .relay/config.json (human edit while the loop is stopped)
+{"supervisor": {"backend": "codex"}}
+relay calibrate --app codex          # process name/title are asked interactively
+relay start
+```
+
+- Codex uses `.relay/CODEX_DONE.json` and `.relay/RULES_CODEX.md`; Claude keeps `CLAUDE_DONE.json`
+  and `RULES_CLAUDE.md`. Existing projects are unaffected until the setting changes.
+- `relay start` requires the selected supervisor's calibration proof plus Zcode's, both resolving
+  to the project folder. A pending turn is pinned to its backend; finish it before switching
+  (switching while running is Part 3, not built yet).
+- Codex refuses to start unless `docs/codex-routing/` matches its `MANIFEST.json` (policy v3.0,
+  model `gpt-6.1-sol`). There is no Claude-routing fallback.
+- `codex_app.model` / `codex_app.effort` default to `gpt-6.1-sol` / `medium`. The model picker
+  must show the expected label; an unverified label pauses the loop.
 
 ## Model policy and Opus limits
 

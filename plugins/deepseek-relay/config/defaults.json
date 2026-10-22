@@ -103,5 +103,13 @@
   "popup_allow_commands": [
     "^git (status|diff)(?: [^;&|`$<>\\n]*)?$",
     "^(?:pytest|python3? -m pytest)(?: [^;&|`$<>\\n]*)?$"
-  ]
+  ],
+  "supervisor": {
+    "backend": "claude"
+  },
+  "codex_app": {
+    "model": "gpt-6.1-sol",
+    "effort": "medium",
+    "timeout_minutes": 30
+  }
 }

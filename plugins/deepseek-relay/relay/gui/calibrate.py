@@ -15,6 +15,7 @@ from .screen import backend_for
 
 DEFAULTS = {
     "claude": {"process_name": "Claude", "title": "Claude"},
+    "codex": {"process_name": "ChatGPT", "title": "Codex"},
     "zcode": {"process_name": "Zcode", "title": "Zcode"},
 }
 
@@ -71,6 +72,10 @@ def calibrate_app(
             "System Settings > Privacy & Security, then QUIT and RELAUNCH that app. macOS caches "
             "these permissions per process; rerunning calibration in the old process is not enough."
         )
+    print(
+        "Notification mirroring: if macOS mirrors iPhone notifications to this Mac, turn it off "
+        "for the ntfy app (or the one-time answer code would appear on screen again)."
+    )
     if not permissions["screen_recording"]:
         raise ConfigError(
             "Grant Screen Recording to the app running Relay in System Settings > Privacy & Security > "
@@ -195,9 +200,10 @@ def calibrate_app(
     return result
 
 
-def shared_folder_status(paths: Paths) -> dict:
+def shared_folder_status(paths: Paths, apps: list[str] | tuple[str, ...] | None = None) -> dict:
+    names = list(apps) if apps else list(DEFAULTS)
     proofs = {}
-    for app in DEFAULTS:
+    for app in names:
         path = paths.calibration_proof(app)
         if not path.exists():
             proofs[app] = None
@@ -210,5 +216,5 @@ def shared_folder_status(paths: Paths) -> dict:
     values = [value for value in proofs.values() if value]
     return {
         "proofs": proofs,
-        "same_folder": len(values) == len(DEFAULTS) and len(set(values)) == 1,
+        "same_folder": len(values) == len(names) and len(set(values)) == 1,
     }

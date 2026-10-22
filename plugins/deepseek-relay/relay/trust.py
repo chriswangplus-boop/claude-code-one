@@ -30,6 +30,8 @@ CODES_NAME = "decision-codes.json"
 DECISIONS_NAME = "decisions.json"
 WAIT_NAME = "wait-fingerprint.json"
 ATTEMPTS_NAME = "attempts.json"
+ACTIONS_NAME = "action-codes.json"
+GIT_CONTROL_NAME = "git-control.json"
 ANCHOR_NAME = "journal-anchor.json"
 TIP_NAME = "journal-tip.json"
 
@@ -222,6 +224,58 @@ class TrustStore:
             return
         attempts.pop(str(attempt_id), None)
         atomic_write_json(self.attempts_path, attempts, mode=0o600)
+
+    # --- one-time codes for CLI actions (R4-1) ----------------------------
+    # `relay resume --clear-halt` and `--adopt-baseline` are human-only actions; a signature
+    # alone only proves Relay wrote the event, not that a human asked for it.
+    @property
+    def actions_path(self) -> Path:
+        return self.root / ACTIONS_NAME
+
+    def _actions(self) -> dict:
+        data = read_json(self.actions_path, default={})
+        return data if isinstance(data, dict) else {}
+
+    def store_action_code(self, action: str, code_hash: str, *, ttl: float, now: float) -> None:
+        actions = self._actions()
+        actions[str(action)] = {
+            "hash": str(code_hash), "expires": float(now) + float(ttl), "issued": float(now),
+        }
+        atomic_write_json(self.actions_path, actions, mode=0o600)
+
+    def action_code(self, action: str) -> dict | None:
+        entry = self._actions().get(str(action))
+        if not isinstance(entry, dict):
+            return None
+        return entry
+
+    def clear_action_code(self, action: str) -> None:
+        actions = self._actions()
+        if str(action) not in actions:
+            return
+        actions.pop(str(action), None)
+        atomic_write_json(self.actions_path, actions, mode=0o600)
+
+    # --- last known good git control files (R4-2) -------------------------
+    @property
+    def git_control_path(self) -> Path:
+        return self.root / GIT_CONTROL_NAME
+
+    def git_control(self) -> dict | None:
+        data = read_json(self.git_control_path, default=None)
+        if not isinstance(data, dict):
+            return None
+        body = {key: value for key, value in data.items() if key != "sig"}
+        if not body.get("hashes"):
+            return None
+        if not self.verify(canonical_json(body), str(data.get("sig") or "")):
+            return None
+        return body["hashes"]
+
+    def set_git_control(self, hashes: dict) -> None:
+        body = {"hashes": {str(k): str(v) for k, v in hashes.items()}}
+        body["sig"] = self.sign(canonical_json(body))
+        atomic_write_json(self.git_control_path, body, mode=0o600)
 
     def prune_attempts(self, keep: set[str]) -> list[str]:
         attempts = self._attempts()

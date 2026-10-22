@@ -20,6 +20,7 @@ from .config import (
 )
 from .context import Context, open_project
 from .decisions import accept_decision, confirm_human, record_instruction
+from .actions import require_action_code
 from .errors import ConfigError, JournalError, RelayError, StateError
 from .integrity import prune_screens
 from .model_policy import opus_usage
@@ -142,7 +143,15 @@ def _runtime(ctx: Context, args) -> tuple[dict, Brain | None, bool]:
 
     if not bool(ctx.cfg.get("gui.enabled", True)):
         raise ConfigError("GUI control is disabled (gui.enabled=false)")
-    for app in ("claude", "zcode"):
+    from .backends import supervisor_backend
+
+    supervisor = supervisor_backend(ctx.cfg)
+    if supervisor == "codex":
+        from .codex_policy import require_codex_policy
+
+        require_codex_policy()
+    apps = (supervisor, "zcode")
+    for app in apps:
         if not ctx.paths.calibration(app).exists():
             raise ConfigError(
                 f"{app} is not calibrated. Run `relay calibrate --app {app}` before starting."
@@ -150,11 +159,12 @@ def _runtime(ctx: Context, args) -> tuple[dict, Brain | None, bool]:
     from .gui.calibrate import shared_folder_status
     from .gui.screen import backend_for
 
-    status = shared_folder_status(ctx.paths)
+    status = shared_folder_status(ctx.paths, apps)
     if not all(status["proofs"].values()):
+        names = ", ".join(f".relay/CALIBRATION_{app}.json" for app in apps)
         raise ConfigError(
-            "calibration self-test is incomplete: both .relay/CALIBRATION_claude.json and "
-            ".relay/CALIBRATION_zcode.json are required. Run `relay calibrate` for each app."
+            f"calibration self-test is incomplete: {names} are required. "
+            "Run `relay calibrate` for each app."
         )
     if not status["same_folder"]:
         raise ConfigError(
@@ -181,10 +191,11 @@ def _runtime(ctx: Context, args) -> tuple[dict, Brain | None, bool]:
     # R3-7: a supervisor that can read the screen or the accessibility tree could read the
     # one-time answer code and answer its own question, so refuse to start.
     _refuse_unsafe_supervisors(ctx)
-    from .apps import make_claude_driver, make_zcode_driver
+    from .apps import make_claude_driver, make_codex_driver, make_zcode_driver
 
+    supervisor_factory = make_codex_driver if supervisor == "codex" else make_claude_driver
     drivers = {
-        "claude": make_claude_driver(ctx.cfg, ctx.paths, ctx.journal, backend, vision),
+        supervisor: supervisor_factory(ctx.cfg, ctx.paths, ctx.journal, backend, vision),
         "coder": make_zcode_driver(ctx.cfg, ctx.paths, ctx.journal, backend, vision),
     }
     monitor_required = False
@@ -288,7 +299,9 @@ def cmd_calibrate(args) -> int:
         ctx, args.app, timeout_seconds=args.timeout, opener=opener, skip_self_test=args.skip_self_test
     )
     print(json.dumps(result, indent=2))
-    status = shared_folder_status(ctx.paths)
+    from .backends import supervisor_backend
+
+    status = shared_folder_status(ctx.paths, (supervisor_backend(ctx.cfg), "zcode"))
     if all(status["proofs"].values()):
         print("shared folder: " + ("verified" if status["same_folder"] else "MISMATCH"))
     return 0
@@ -318,6 +331,17 @@ def cmd_resume(args) -> int:
             "the monitor left a HALT flag. Review .relay/MONITOR_NOTES.md, fix the cause, then "
             "run `relay resume --clear-halt`."
         )
+    selected = [
+        name for name, on in (
+            ("--clear-halt", args.clear_halt),
+            ("--adopt-baseline", getattr(args, "adopt_baseline", False)),
+            ("--accept-git-control", getattr(args, "accept_git_control", False)),
+        ) if on
+    ]
+    if len(selected) > 1:
+        raise ConfigError(
+            "run " + ", ".join(selected) + " separately: each needs its own one-time code"
+        )
     if args.clear_halt:
         ok, errors = ctx.journal.verify()
         if not ok:
@@ -325,6 +349,13 @@ def cmd_resume(args) -> int:
                 "journal integrity check failed, so the halt cannot be cleared: "
                 + "; ".join(errors[:3])
             )
+        # R4-1: clearing the monitor's safety stop is a human-only action. A signature only
+        # proves Relay wrote the event, so a one-time code is required.
+        require_action_code(
+            ctx, "clear-halt", getattr(args, "code", None),
+            question="Clear the monitor HALT and resume the loop?",
+            notifier=_notifier(ctx),
+        )
         previous = ctx.store.read_flag("halt") or {}
         ctx.store.clear_flag("halt")
         ctx.journal.append(
@@ -332,7 +363,25 @@ def cmd_resume(args) -> int:
             detail={"previous_reason": previous.get("reason")},
         )
     if getattr(args, "adopt_baseline", False):
+        require_action_code(
+            ctx, "adopt-baseline", getattr(args, "code", None),
+            question="Adopt the current project files as the pending turn's baseline?",
+            notifier=_notifier(ctx),
+        )
         _adopt_baseline(ctx)
+    if getattr(args, "accept_git_control", False):
+        require_action_code(
+            ctx, "accept-git-control", getattr(args, "code", None),
+            question="Accept the current .git/config and .gitattributes as the safe baseline?",
+            notifier=_notifier(ctx),
+        )
+        from .integrity import accept_git_control
+
+        hashes = accept_git_control(ctx.cfg.project_dir)
+        ctx.journal.append(
+            "git.control_accepted", actor="human",
+            detail={"files": sorted(hashes)[:20]},
+        )
     return _run_loop(ctx, args, resume=True)
 
 
@@ -662,7 +711,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.set_defaults(func=cmd_init)
 
     calibrate = sub.add_parser("calibrate", parents=[common], help="interactively calibrate one app")
-    calibrate.add_argument("--app", required=True, choices=["claude", "zcode"])
+    calibrate.add_argument("--app", required=True, choices=["claude", "codex", "zcode"])
     calibrate.add_argument("--timeout", type=int, default=240)
     calibrate.add_argument("--skip-self-test", action="store_true")
     calibrate.set_defaults(func=cmd_calibrate)
@@ -686,6 +735,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume = sub.add_parser("resume", parents=[common], help="resume a paused or waiting loop")
     resume.add_argument("--clear-halt", action="store_true", help="clear a monitor HALT after review")
+    resume.add_argument(
+        "--accept-git-control", action="store_true",
+        help="record the current .git/config and .gitattributes as the safe baseline",
+    )
+    resume.add_argument(
+        "--code", default=None,
+        help="one-time code for --clear-halt / --adopt-baseline / --accept-git-control",
+    )
     resume.add_argument(
         "--adopt-baseline", action="store_true",
         help="adopt the current files as the signed baseline of a pending turn that predates R3-4",

@@ -39,7 +39,7 @@ class StubBrain:
 
 class ScriptedApps:
     def __init__(self, project: Path, verdicts=("PROJECT_DONE",), decision: dict | None = None,
-                 reviewer_ctx: int = 45, coder_ctx: int = 45):
+                 reviewer_ctx: int = 45, coder_ctx: int = 45, supervisor: str = "claude"):
         self.project = Path(project)
         self.verdicts = deque(verdicts)
         self.decision = decision
@@ -54,11 +54,12 @@ class ScriptedApps:
         self.crash_review_once = False
         self.hook_once = False
         self.coder_reads: list[list[str]] = []
-        self.claude = FakeAppDriver("claude", project, on_ring=self._claude_ring)
+        self.supervisor = supervisor
+        self.claude = FakeAppDriver(supervisor, project, on_ring=self._claude_ring)
         self.coder = FakeAppDriver("coder", project, on_ring=self._coder_ring)
 
     def drivers(self):
-        return {"claude": self.claude, "coder": self.coder}
+        return {self.supervisor: self.claude, "coder": self.coder}
 
     def _write(self, rel: str, text: str) -> Path:
         path = self.project / rel
@@ -75,17 +76,17 @@ class ScriptedApps:
             return
         if pointer.startswith("RELAY checkpoint"):
             self._write(f".relay/CHECKPOINT_{role}.md", f"checkpoint {role} {round_no}")
-            write_sentinel(self.project, role, round_no, f".relay/CHECKPOINT_{role}.md", context_pct=70)
+            write_sentinel(self.project, role, round_no, f".relay/CHECKPOINT_{role}.md", context_pct=70, backend=self.supervisor)
             return
         if role in ("planner", "strategist"):
             if role == "strategist":
                 self._write(".relay/STRATEGY.md", f"strategy for round {round_no}")
             self._write(".relay/PLAN.md", f"plan for round {round_no}")
             self._write(".relay/HANDOFF.md", f"handoff content {round_no}")
-            write_sentinel(self.project, role, round_no, ".relay/HANDOFF.md", context_pct=30)
+            write_sentinel(self.project, role, round_no, ".relay/HANDOFF.md", context_pct=30, backend=self.supervisor)
         elif role == "fixer":
             self._write(".relay/FIX_REPORT.md", f"fix report {round_no}")
-            write_sentinel(self.project, "fixer", round_no, ".relay/FIX_REPORT.md", context_pct=35)
+            write_sentinel(self.project, "fixer", round_no, ".relay/FIX_REPORT.md", context_pct=35, backend=self.supervisor)
         elif role == "reviewer":
             if self.crash_review_once:
                 self.crash_review_once = False
@@ -94,7 +95,7 @@ class ScriptedApps:
             self._write(".relay/REVIEW.md", f"review {round_no}: {verdict}")
             write_sentinel(
                 self.project, "reviewer", round_no, ".relay/REVIEW.md",
-                verdict=verdict, context_pct=self.reviewer_ctx,
+                verdict=verdict, context_pct=self.reviewer_ctx, backend=self.supervisor,
             )
 
     def _coder_ring(self, driver, pointer):
@@ -158,7 +159,7 @@ class ScriptedApps:
 
 
 def build(ctx, *, verdicts=("PROJECT_DONE",), decision=None, notifier=None,
-          reviewer_ctx=45, coder_ctx=45, **cfg):
+          reviewer_ctx=45, coder_ctx=45, supervisor="claude", **cfg):
     init_project(ctx.cfg, ctx.paths, ctx.store, ctx.journal, goal="Build a tiny todo CLI")
     # R3-7: the code is delivered only by phone (ntfy with a token) or an interactive terminal.
     ctx.cfg.set("notify.ntfy", True)
@@ -166,7 +167,11 @@ def build(ctx, *, verdicts=("PROJECT_DONE",), decision=None, notifier=None,
     ctx.cfg.set("ntfy.topic", "test-topic")
     for key, value in cfg.items():
         ctx.cfg.set(key, value)
-    apps = ScriptedApps(ctx.cfg.project_dir, verdicts, decision, reviewer_ctx=reviewer_ctx, coder_ctx=coder_ctx)
+    apps = ScriptedApps(
+        ctx.cfg.project_dir, verdicts, decision, reviewer_ctx=reviewer_ctx,
+        coder_ctx=coder_ctx, supervisor=supervisor,
+    )
+    ctx.cfg.set("supervisor.backend", supervisor)
     notifier = notifier or FakeNotifier()
     brain = StubBrain()
     orch = Orchestrator(ctx, apps.drivers(), brain=brain, notifier=notifier)
@@ -725,6 +730,25 @@ def test_replans_reset_on_milestone_done(ctx):
 # --- N2: git hooks planted before or during a turn never run -----------------
 
 def test_planted_hook_does_not_run_on_a_turn_commit(ctx):
+    from relay import integrity
+
+    orch, apps, notifier, _ = build(ctx)
+    marker = ctx.cfg.project_dir / "hook-ran"
+    hook = ctx.cfg.project_dir / ".git/hooks/pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\ntouch \"$(dirname \"$0\")/../../../hook-ran\"\n")
+    hook.chmod(0o755)
+    # A hook that exists before Relay's verified baseline is neutralised, not fatal.
+    integrity.record_git_control(ctx.cfg.project_dir)
+
+    orch.run(max_steps=2)
+
+    assert ctx.journal.of_type("git.commit")
+    assert not marker.exists(), "Relay's commit ran the planted hook"
+
+
+def test_a_hook_planted_between_turns_pauses_before_any_git_command(ctx):
+    """R4-2: a change made while Relay was stopped is caught before git runs it."""
     orch, apps, notifier, _ = build(ctx)
     marker = ctx.cfg.project_dir / "hook-ran"
     hook = ctx.cfg.project_dir / ".git/hooks/pre-commit"
@@ -732,10 +756,12 @@ def test_planted_hook_does_not_run_on_a_turn_commit(ctx):
     hook.write_text("#!/bin/sh\ntouch \"$(dirname \"$0\")/../../../hook-ran\"\n")
     hook.chmod(0o755)
 
-    orch.run(max_steps=2)
+    state = orch.run(max_steps=2, wait_human=False)
 
-    assert ctx.journal.of_type("git.commit")
-    assert not marker.exists(), "Relay's commit ran the planted hook"
+    assert state["phase"] == "PAUSED"
+    assert "changed since the last verified turn" in str(state.get("paused_reason"))
+    assert not ctx.journal.of_type("git.commit")
+    assert not marker.exists()
 
 
 def test_hook_planted_during_a_turn_is_a_violation_and_does_not_run(ctx):
@@ -820,12 +846,13 @@ def test_rewriting_state_json_cannot_answer_a_decision(ctx):
     assert len(ctx.journal.of_type("decision.answered")) == 1
 
 
-def test_state_edits_while_waiting_for_a_decision_pause(ctx, monkeypatch):
+def test_state_edits_while_waiting_for_a_decision_are_reasked(ctx, monkeypatch):
     import relay.orchestrator as orchestrator_module
 
     orch, apps, notifier, _ = _decision_build(ctx)
     state = orch.run(max_steps=10, wait_human=False)
     assert state["phase"] == "WAIT_HUMAN"
+    old_id = state["pending_decision"]["id"]
 
     calls = {"n": 0}
 
@@ -838,9 +865,10 @@ def test_state_edits_while_waiting_for_a_decision_pause(ctx, monkeypatch):
     monkeypatch.setattr(orchestrator_module, "local_answer", tampering)
     orch.wait_for_decision()
 
+    # R4-4: the tamper is kept as evidence and the question is re-asked with a new id/code.
     state = ctx.store.load()
-    assert state["phase"] == "PAUSED"
-    assert "tampering" in state["paused_reason"]
+    assert state["phase"] == "WAIT_HUMAN"
+    assert state["pending_decision"]["id"] != old_id
     assert ctx.journal.of_type("decision.tamper")
 
 

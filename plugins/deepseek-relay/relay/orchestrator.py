@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .backends import rules_name, sentinel_name, supervisor_backend
 from .brain import Brain
 from .config import Config, ntfy_token, ntfy_topic
 from .context import Context
@@ -28,11 +29,12 @@ from .gui.recovery import Recovery
 from .gui.screen import ScreenError
 from .integrity import (
     changed_paths, git_commit, git_control_changes, git_control_snapshot, git_snapshot,
+    record_git_control,
     ownership_violations, read_sentinel, secret_scan, snapshot, validate_sentinel,
 )
 from .journal import Journal
 from .model_policy import (
-    CLAUDE_ROLES, choose_turn, expected_file, is_claude_role, opus_usage, policy, role_app,
+    CLAUDE_ROLES, choose_turn, expected_file, is_claude_role, opus_usage, policy,
 )
 from .policy import choose_button, decide_popup
 from .redact import redact
@@ -138,6 +140,20 @@ class Orchestrator:
         self._first_prepare = True
         self._decision_codes: dict[str, str] = {}
         self._run_id = uuid.uuid4().hex[:8]
+        self.backend = supervisor_backend(self.cfg)
+
+    def _app(self, role: str) -> str:
+        """Which app holds this role for the selected supervisor backend."""
+        return "coder" if role == "coder" else self.backend
+
+    def _sentinel(self, role: str):
+        return self.paths.sentinel(role, self.backend)
+
+    def _sentinel_name(self, role: str) -> str:
+        return sentinel_name(role, self.backend)
+
+    def _rules(self, role: str) -> str:
+        return f".relay/{rules_name(role, self.backend)}"
 
     # --- public -----------------------------------------------------------
     def run(self, *, max_steps: int | None = None, wait_human: bool = True) -> dict:
@@ -297,6 +313,9 @@ class Orchestrator:
                     "state.transition", state=recovered["target"],
                     detail={"recovered": "missing pending decision"},
                 )
+        state = self._state()
+        if state.get("phase") == "WAIT_HUMAN" and isinstance(state.get("pending_decision"), dict):
+            self._reask_if_tampered()
         state = self._state()
         if state.get("phase") == "WAIT_HUMAN":
             parsed = local_answer(self.paths)
@@ -629,7 +648,7 @@ class Orchestrator:
         """
         if not is_claude_role(role):
             return {"model_verified": "unverifiable", "effort_verified": "unverifiable"}
-        driver = self.drivers[role_app(role)]
+        driver = self.drivers[self._app(role)]
         result = driver.select_model(str(model), str(effort), role) or {}
         return {
             "model_verified": result.get("model_verified", True),
@@ -700,6 +719,13 @@ class Orchestrator:
             model_verified = pending.get("model_verified", "unverifiable")
             effort_verified = pending.get("effort_verified", "unverifiable")
             escalated = bool(pending.get("escalated"))
+            pinned = str(pending.get("backend") or "")
+            if pinned and pinned != self.backend:
+                raise PauseRequested(
+                    f"this turn was started on the {pinned} supervisor and Relay cannot switch "
+                    f"backend mid-turn. Finish it with supervisor.backend={pinned}, then switch "
+                    "(manual switching is Part 3)."
+                )
             attempt_id = str(pending.get("attempt_id") or "")
             baseline = self.trust.attempt(attempt_id) if attempt_id else None
             if baseline is None:
@@ -802,6 +828,7 @@ class Orchestrator:
                     "issue_ids": issue_ids,
                     "trigger": choice.trigger,
                     "attempt_id": attempt_id,
+                    "backend": self.backend,
                 }
 
             self.store.mutate(apply)
@@ -816,15 +843,15 @@ class Orchestrator:
                     },
                 )
 
-        driver = self.drivers[role_app(role)]
-        sentinel_path = self.paths.sentinel(role)
+        driver = self.drivers[self._app(role)]
+        sentinel_path = self._sentinel(role)
         if resuming and sentinel_path.exists():
             try:
                 sentinel = read_sentinel(sentinel_path)
                 issues = validate_sentinel(
                     sentinel, root=self.cfg.project_dir, expected_round=round_no,
                     expected_role=role, expected_file=expected,
-                    round_started_wall=started_wall,
+                    round_started_wall=started_wall, expected_backend=self.backend,
                 )
             except IntegrityError as exc:
                 sentinel = None
@@ -844,7 +871,7 @@ class Orchestrator:
 
         if resuming:
             # Forget the crashed chat so the role is re-opened and re-seeded (P2-7).
-            app = role_app(role)
+            app = self._app(role)
             self.store.mutate(
                 lambda current: current.setdefault("active_session", {}).pop(app, None)
             )
@@ -870,7 +897,8 @@ class Orchestrator:
             state=phase,
             round_no=round_no,
             detail={
-                "role": role, "app": role_app(role), "expected": expected, "pointer": pointer,
+                "role": role, "app": self._app(role), "expected": expected, "pointer": pointer,
+                "backend": self.backend,
                 "model": model, "effort": effort, "model_verified": model_verified,
                 "effort_verified": effort_verified,
                 "trigger": (pending.get("trigger") if resuming else choice.trigger),
@@ -903,14 +931,14 @@ class Orchestrator:
         `force_new` opens a fresh chat even when the role is unchanged. Opus turns use it so
         their context stays small (Part B3).
         """
-        app = role_app(role)
+        app = self._app(role)
         state = self._state()
         active = state.get("active_session") or {}
         outgoing = active.get(app)
         if outgoing == role and not force_new:
             return
         if (
-            app == "claude"
+            app == self.backend
             and outgoing in CLAUDE_ROLES
             and outgoing not in ("strategist", "fixer")
             and (outgoing != role or force_new)
@@ -940,10 +968,10 @@ class Orchestrator:
 
     def _checkpoint_before_switch(self, outgoing: str, round_no: int) -> None:
         """Write the outgoing role's checkpoint before its chat is replaced."""
-        driver = self.drivers[role_app(outgoing)]
+        driver = self.drivers[self._app(outgoing)]
         checkpoint_rel = f".relay/CHECKPOINT_{outgoing}.md"
         pointer = self._checkpoint_pointer(outgoing, round_no)
-        sentinel_path = self.paths.sentinel(outgoing)
+        sentinel_path = self._sentinel(outgoing)
         sentinel_path.unlink(missing_ok=True)
         started_wall = self.wall()
         self.store.set_baton(outgoing, outgoing, round_no)
@@ -991,6 +1019,7 @@ class Orchestrator:
                     detail={"hash": commit, "message": "checkpoint before role switch"},
                 )
         self.store.clear_baton()
+        record_git_control(self.cfg.project_dir)
         state = self._state()
         state["session_rounds"][outgoing] = 0
         state["session_ctx"][outgoing] = 0
@@ -1238,10 +1267,12 @@ class Orchestrator:
             },
             outputs=[
                 {"path": str(sentinel.get("file")), "sha256": sentinel.get("sha256")},
-                {"path": f".relay/{self.paths.sentinel(role).name}",
-                 "sha256": sha256_file(self.paths.sentinel(role))},
+                {"path": f".relay/{self._sentinel(role).name}",
+                 "sha256": sha256_file(self._sentinel(role))},
             ],
         )
+        # R4-2: this turn passed its checks, so its git control files are the new known good.
+        record_git_control(self.cfg.project_dir)
         if archive_plan.get("reason"):
             self._archive_fix_plan(round_no, str(archive_plan["reason"]))
 
@@ -1269,7 +1300,7 @@ class Orchestrator:
             max_rounds = int(self.cfg.get("claude_app.max_rounds_per_session", 4))
         ratio = int(state["session_rounds"].get(role, 0)) / max(1, max_rounds)
         signals = [float(state["session_ctx"].get(role, 0) or 0)]
-        driver = self.drivers[role_app(role)]
+        driver = self.drivers[self._app(role)]
         try:
             live = driver.read_context_pct()
         except (BrainError, VisionUnavailable):
@@ -1302,10 +1333,10 @@ class Orchestrator:
         self._rollover(role, round_no, reason)
 
     def _rollover(self, role: str, round_no: int, reason: str) -> None:
-        driver = self.drivers[role_app(role)]
+        driver = self.drivers[self._app(role)]
         checkpoint_rel = f".relay/CHECKPOINT_{role}.md"
         pointer = self._checkpoint_pointer(role, round_no)
-        sentinel_path = self.paths.sentinel(role)
+        sentinel_path = self._sentinel(role)
         sentinel_path.unlink(missing_ok=True)
         started_wall = self.wall()
         self.store.set_baton(role, role, round_no)
@@ -1360,11 +1391,12 @@ class Orchestrator:
             # Reload under the lock so a concurrent decision/instruct is not lost.
             current.setdefault("session_rounds", {})[role] = 0
             current.setdefault("session_ctx", {})[role] = 0
-            current.setdefault("active_session", {})[role_app(role)] = role
+            current.setdefault("active_session", {})[self._app(role)] = role
 
         self.store.mutate(apply)
         self.store.clear_baton()
         self.trust.clear_attempt(attempt_id)
+        record_git_control(self.cfg.project_dir)
         checkpoint = self.cfg.project_dir / checkpoint_rel
         if checkpoint.exists():
             try:
@@ -1437,6 +1469,7 @@ class Orchestrator:
                     "git.commit", round_no=round_no,
                     detail={"hash": commit, "message": "archive FIX_PLAN"},
                 )
+        record_git_control(self.cfg.project_dir)
 
     def _build_pointer(
         self, phase: str, role: str, round_no: int, *,
@@ -1454,16 +1487,16 @@ class Orchestrator:
                 text = (
                     f"RELAY round {round_no} role=strategist: re-think the approach. Read "
                     f".relay/GOAL.md, .relay/PLAN.md, .relay/REVIEW.md, .relay/CODER_REPORT.md, "
-                    f"{decisions}, {notes} and .relay/RULES_CLAUDE.md (strategist section). "
+                    f"{decisions}, {notes} and {self._rules(role)} (strategist section). "
                     "Write .relay/STRATEGY.md, update .relay/PLAN.md and .relay/HANDOFF.md, then "
-                    ".relay/CLAUDE_DONE.json last."
+                    ".relay/{self._sentinel_name(role)} last."
                 )
             else:
                 text = (
                     f"RELAY round {round_no} role=planner: read {base} (sha256 {self._hint(base)}), "
                     f".relay/PLAN.md, .relay/REVIEW.md, .relay/CODER_REPORT.md, {decisions}, {notes} "
-                    "and .relay/RULES_CLAUDE.md (planner section). "
-                    "Write .relay/PLAN.md and .relay/HANDOFF.md, then .relay/CLAUDE_DONE.json last."
+                    "and {self._rules(role)} (planner section). "
+                    "Write .relay/PLAN.md and .relay/HANDOFF.md, then .relay/{self._sentinel_name(role)} last."
                 )
         elif phase == "CODE" and role == "fixer":
             issues = ", ".join(getattr(choice, "issue_ids", ()) or ()) or "the named issues"
@@ -1471,9 +1504,9 @@ class Orchestrator:
             text = (
                 f"RELAY round {round_no} role=fixer: fix only {issues}. Read .relay/REVIEW.md "
                 f"(sha256 {self._hint('.relay/REVIEW.md')}), {plan}.relay/HANDOFF.md, {decisions}, {notes} "
-                "and .relay/RULES_CLAUDE.md (fixer section). Change at most "
+                "and {self._rules(role)} (fixer section). Change at most "
                 f"{int(policy(self.cfg)['fixer_max_files'])} source files, run the tests, write "
-                ".relay/FIX_REPORT.md, then .relay/CLAUDE_DONE.json last."
+                ".relay/FIX_REPORT.md, then .relay/{self._sentinel_name(role)} last."
             )
         elif phase == "CODE":
             plan = ".relay/FIX_PLAN.md, " if fix_plan else ""
@@ -1502,14 +1535,14 @@ class Orchestrator:
             text = (
                 f"RELAY round {round_no} role=reviewer: read .relay/HANDOFF.md "
                 f"(sha256 {self._hint('.relay/HANDOFF.md')}), {report} (sha256 {self._hint(report)}), "
-                f".relay/PLAN.md, {decisions}, {notes}, .relay/RULES_CLAUDE.md (reviewer)."
+                f".relay/PLAN.md, {decisions}, {notes}, {self._rules(role)} (reviewer)."
                 + previous_text + plan +
-                " Write .relay/REVIEW.md, then .relay/CLAUDE_DONE.json last."
+                " Write .relay/REVIEW.md, then .relay/{self._sentinel_name(role)} last."
             )
         return ascii_pointer(text)
 
     def _checkpoint_pointer(self, role: str, round_no: int) -> str:
-        sentinel = "CODER_DONE.json" if role == "coder" else "CLAUDE_DONE.json"
+        sentinel = self._sentinel_name(role)
         text = (
             f"RELAY checkpoint round {round_no} role={role}: write .relay/CHECKPOINT_{role}.md "
             f"(max 150 lines: decisions, status, open issues not already in files), then .relay/{sentinel} "
@@ -1518,7 +1551,7 @@ class Orchestrator:
         return ascii_pointer(text)
 
     def _seed_pointer(self, role: str) -> str:
-        rules = ".relay/RULES_CODER.md" if role == "coder" else ".relay/RULES_CLAUDE.md"
+        rules = self._rules(role)
         section = "coder" if role == "coder" else role
         extras = ""
         if role == "reviewer":
@@ -1533,7 +1566,7 @@ class Orchestrator:
         return ascii_pointer(text)
 
     def _nudge_pointer(self, spec: WaitSpec) -> str:
-        sentinel = "CODER_DONE.json" if spec.role == "coder" else "CLAUDE_DONE.json"
+        sentinel = self._sentinel_name(spec.role)
         return ascii_pointer(
             f"RELAY nudge round {spec.round_no} role={spec.role}: you stopped before writing "
             f".relay/{sentinel}. Write it now, last, announcing {spec.expected_file} with its sha256."
@@ -1544,12 +1577,19 @@ class Orchestrator:
         p = policy(self.cfg)
         if role == "coder":
             return str(self.cfg.get("zcode_app.model", "")), str(self.cfg.get("zcode_app.effort", "high"))
+        if self.backend == "codex":
+            return (
+                str(self.cfg.get("codex_app.model", "gpt-6.1-sol")),
+                str(self.cfg.get("codex_app.effort", "medium")),
+            )
         slot = p["escalated"] if role in ("strategist", "fixer") else p["default"]
         return str(slot["model"]), str(slot["effort"])
 
     def _timeout_minutes(self, role: str) -> int:
         if role == "coder":
             return int(self.cfg.get("zcode_app.timeout_minutes", 60))
+        if self.backend == "codex":
+            return int(self.cfg.get("codex_app.timeout_minutes", 30))
         return int(self.cfg.get("claude_app.timeout_minutes", 30))
 
     # --- GUI --------------------------------------------------------------
@@ -1686,8 +1726,8 @@ class Orchestrator:
             self._last_busy = None
 
     def _wait(self, spec: WaitSpec) -> dict:
-        driver = self.drivers[role_app(spec.role)]
-        sentinel_path = self.paths.sentinel(spec.role)
+        driver = self.drivers[self._app(spec.role)]
+        sentinel_path = self._sentinel(spec.role)
         deadline = spec.started_epoch + spec.timeout_minutes * 60
         next_screen = spec.started_epoch
         last_reject: str | None = None
@@ -1705,7 +1745,7 @@ class Orchestrator:
                     issues = validate_sentinel(
                         sentinel, root=self.cfg.project_dir, expected_round=spec.round_no,
                         expected_role=spec.role, expected_file=spec.expected_file,
-                        round_started_wall=spec.started_wall,
+                        round_started_wall=spec.started_wall, expected_backend=self.backend,
                     )
                 except IntegrityError as exc:
                     sentinel = None
@@ -2009,6 +2049,7 @@ class Orchestrator:
         self.trust.store_decision(
             {
                 "id": decision_id,
+                "question": question,
                 "question_sha256": sha256_text(question),
                 "options": clean_options,
                 "kind": kind,
@@ -2076,11 +2117,52 @@ class Orchestrator:
     def _decision_fingerprint(self) -> tuple[str, str]:
         return decision_fingerprint(self._state(), self.paths)
 
+    def _reask_if_tampered(self) -> None:
+        """R4-4: a decision edited while Relay was stopped is re-asked, not dead-ended."""
+        state = self._state()
+        pending = state.get("pending_decision") or {}
+        decision_id = str(pending.get("id") or "")
+        if not decision_id:
+            return
+        stored = self.trust.wait_fingerprint(decision_id)
+        if stored is None or stored == self._decision_fingerprint():
+            return
+        self._decision_tampered(
+            decision_id, "STATE.json or the question changed while Relay was stopped"
+        )
+
     def _decision_tampered(self, decision_id: str, reason: str) -> None:
+        """R4-4: keep the tamper evidence, then re-ask the question with a fresh code."""
+        record = self.trust.decision(decision_id)
         self.journal.append(
             "decision.tamper", detail={"id": decision_id, "reason": reason}, result="blocked"
         )
-        self._pause(f"decision tampering detected: {reason}")
+        self.trust.clear_decision(decision_id)
+        self.trust.clear_code(decision_id)
+        self.trust.clear_wait_fingerprint()
+
+        def clear(current: dict) -> None:
+            current["pending_decision"] = None
+            current["phase"] = current.get("return_to") or "PLAN"
+            current["return_to"] = None
+            current["paused_reason"] = None
+
+        self.store.mutate(clear)
+        question = str((record or {}).get("question") or "")
+        if not question:
+            self._pause(
+                "decision tampering detected and the original question is no longer provable; "
+                "inspect the project and re-run the step that asked it"
+            )
+            return
+        self.escalate_human(
+            question,
+            (record or {}).get("options") or DEFAULT_OPTIONS,
+            reason="the previous decision was tampered with; it was re-asked with a new code",
+            return_to=(record or {}).get("return_to"),
+            kind=(record or {}).get("kind"),
+            data=(record or {}).get("data"),
+        )
 
     def wait_for_decision(self) -> None:
         state = self._state()

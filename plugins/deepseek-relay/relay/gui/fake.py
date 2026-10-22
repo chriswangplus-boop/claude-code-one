@@ -24,6 +24,8 @@ def write_sentinel(
     question: str | None = None,
     options: list[dict] | None = None,
     blocking_issue_ids: list[str] | None = None,
+    sentinel_name: str | None = None,
+    backend: str | None = None,
 ) -> Path:
     target = project_dir / file_rel
     if not target.exists():
@@ -42,7 +44,12 @@ def write_sentinel(
         "options": options,
         "blocking_issue_ids": blocking_issue_ids,
     }
-    sentinel = project_dir / ".relay" / ("CODER_DONE.json" if role == "coder" else "CLAUDE_DONE.json")
+    if backend:
+        payload["backend"] = backend
+    from ..backends import sentinel_name as default_sentinel
+
+    name = sentinel_name or default_sentinel(role, backend or "claude")
+    sentinel = project_dir / ".relay" / name
     sentinel.parent.mkdir(parents=True, exist_ok=True)
     sentinel.write_text(json.dumps(payload, indent=2))
     return sentinel

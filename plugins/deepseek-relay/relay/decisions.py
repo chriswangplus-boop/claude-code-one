@@ -255,13 +255,14 @@ def _accept_locked(ctx: Context, answer: str, code: str, by: str) -> dict:
     question = str(pending.get("question") or "")
     if str(record.get("question_sha256") or "") != sha256_text(question):
         raise IntegrityError(
-            "the pending question was changed after it was asked; refusing the answer"
+            "the pending question was changed after it was asked; refusing the answer. "
+            "Run `relay resume` to re-ask it with a new one-time code."
         )
     stored = ctx.trust.wait_fingerprint(decision_id)
     if stored is not None and stored != decision_fingerprint(state, ctx.paths):
         raise IntegrityError(
             "STATE.json or PENDING_DECISION.md changed while the decision was pending; "
-            "refusing the answer"
+            "refusing the answer. Run `relay resume` to re-ask it with a new one-time code."
         )
     expected = str(record.get("code_hash") or "")
     if not expected:

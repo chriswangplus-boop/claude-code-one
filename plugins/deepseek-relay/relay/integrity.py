@@ -17,21 +17,22 @@ from .util import sha256_file
 HARNESS_OWNED = {
     "STATE.json", "BATON.json", "PENDING_DECISION.md", "DECISIONS.md", "HEARTBEAT.json",
     "config.json", "GOAL.md", "PAUSE", "STOP", "HALT", ".lock", ".run.pid",
-    "RULES_CLAUDE.md", "RULES_CODER.md",
+    "RULES_CLAUDE.md", "RULES_CODEX.md", "RULES_CODER.md",
 }
 # Which role may write which agent file. Source files belong to the role that holds the
 # baton: the coder normally, the fixer only during a fixer turn (Part B).
 ROLE_FILES: dict[str, set[str]] = {
-    "planner": {"PLAN.md", "HANDOFF.md", "CHECKPOINT_planner.md", "CLAUDE_DONE.json"},
-    "reviewer": {"REVIEW.md", "FIX_PLAN.md", "CHECKPOINT_reviewer.md", "CLAUDE_DONE.json"},
+    "planner": {"PLAN.md", "HANDOFF.md", "CHECKPOINT_planner.md", "CLAUDE_DONE.json", "CODEX_DONE.json"},
+    "reviewer": {"REVIEW.md", "FIX_PLAN.md", "CHECKPOINT_reviewer.md", "CLAUDE_DONE.json", "CODEX_DONE.json"},
     "strategist": {
         "PLAN.md", "HANDOFF.md", "STRATEGY.md", "CHECKPOINT_strategist.md", "CLAUDE_DONE.json",
+        "CODEX_DONE.json",
     },
-    "fixer": {"FIX_REPORT.md", "HANDOFF.md", "CHECKPOINT_fixer.md", "CLAUDE_DONE.json"},
+    "fixer": {"FIX_REPORT.md", "HANDOFF.md", "CHECKPOINT_fixer.md", "CLAUDE_DONE.json", "CODEX_DONE.json"},
     "coder": {"CODER_REPORT.md", "CODER_DONE.json", "CHECKPOINT_coder.md"},
 }
 CLAUDE_OWNED = {"PLAN.md", "HANDOFF.md", "REVIEW.md", "FIX_PLAN.md", "STRATEGY.md", "FIX_REPORT.md",
-                "CLAUDE_DONE.json", "CHECKPOINT_planner.md", "CHECKPOINT_reviewer.md",
+                "CLAUDE_DONE.json", "CODEX_DONE.json", "CHECKPOINT_planner.md", "CHECKPOINT_reviewer.md",
                 "CHECKPOINT_strategist.md", "CHECKPOINT_fixer.md"}
 CODER_OWNED = {"CODER_REPORT.md", "CODER_DONE.json", "CHECKPOINT_coder.md"}
 
@@ -223,6 +224,7 @@ def validate_sentinel(
     expected_file: str,
     round_started_wall: float,
     mtime_tolerance: float = 2.0,
+    expected_backend: str = "claude",
 ) -> list[str]:
     """Return a list of problems; an empty list means the sentinel may be trusted."""
     issues: list[str] = []
@@ -277,6 +279,12 @@ def validate_sentinel(
                 if not isinstance(item, str) or not ISSUE_ID.match(item):
                     issues.append(f"blocking_issue_ids has an invalid slug: {item!r}")
 
+    backend = sentinel.get("backend")
+    if backend is not None and str(backend) != str(expected_backend):
+        issues.append(
+            f"sentinel is for the {backend} supervisor, expected {expected_backend}"
+        )
+
     announced = str(sentinel.get("file") or "")
     if not announced:
         issues.append("file is missing")
@@ -300,7 +308,9 @@ def validate_sentinel(
             if target.stat().st_mtime + mtime_tolerance < round_started_wall:
                 issues.append("announced file predates this round")
 
-    sentinel_path = root / ".relay" / ("CODER_DONE.json" if expected_role == "coder" else "CLAUDE_DONE.json")
+    from .backends import sentinel_name
+
+    sentinel_path = root / ".relay" / sentinel_name(expected_role, expected_backend)
     if sentinel_path.exists() and sentinel_path.stat().st_mtime + mtime_tolerance < round_started_wall:
         issues.append("sentinel predates this round (stale)")
 
@@ -335,6 +345,28 @@ GIT_CONTROL_PATHS = (".git/config", ".git/info/attributes", ".gitmodules")
 # this explicit allowlist (git-lfs is the only common safe case).
 GIT_DRIVER_ALLOWLIST = {"lfs"}
 GIT_CREDENTIAL_ALLOWLIST = {"", "osxkeychain", "store", "cache", "libsecret", "manager"}
+# R4-2: the driver *name* is not enough. An agent can define filter.lfs.clean as any command.
+# The lfs filter is allowed only with the exact standard git-lfs values.
+GIT_LFS_VALUES = {
+    "clean": "git-lfs clean -- %f",
+    "smudge": "git-lfs smudge -- %f",
+    "process": "git-lfs filter-process",
+    "required": "true",
+}
+GIT_LFS_SAFE_DIFF = {"git-lfs textconv"}
+GIT_LFS_SAFE_MERGE = {"git-lfs merge"}
+
+# One trust store per project root: a process can open several projects (tests do).
+_TRUST_BY_ROOT: dict[str, object] = {}
+
+
+def bind_trust(trust) -> None:
+    """Give the git guard the external trust store for this project (from open_project)."""
+    _TRUST_BY_ROOT[str(Path(trust.project_dir).resolve())] = trust
+
+
+def _trust_for(root: str | Path):
+    return _TRUST_BY_ROOT.get(str(Path(root).resolve()))
 GIT_SECTION = re.compile(r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]\s*$')
 
 
@@ -399,14 +431,21 @@ def git_config_risks(root: str | Path) -> list[str]:
             lowered = value.strip().lower()
             if name == "include" or name == "includeif":
                 continue
-            if name == "filter" and sub and key in ("clean", "smudge", "process"):
-                if sub not in GIT_DRIVER_ALLOWLIST:
+            if name == "filter" and sub and key in ("clean", "smudge", "process", "required"):
+                if sub in GIT_DRIVER_ALLOWLIST:
+                    expected = GIT_LFS_VALUES.get(key)
+                    if key == "required":
+                        if lowered not in ("true", "false"):
+                            risks.append(f"{label}: filter.{sub}.required")
+                    elif expected is None or " ".join(value.split()) != expected:
+                        risks.append(f"{label}: filter.{sub}.{key} (not the standard git-lfs command)")
+                else:
                     risks.append(f"{label}: filter.{sub}.{key}")
             elif name == "diff" and sub and key in ("textconv", "command"):
-                if sub not in GIT_DRIVER_ALLOWLIST:
+                if not (sub in GIT_DRIVER_ALLOWLIST and " ".join(value.split()) in GIT_LFS_SAFE_DIFF):
                     risks.append(f"{label}: diff.{sub}.{key}")
             elif name == "merge" and sub and key == "driver":
-                if sub not in GIT_DRIVER_ALLOWLIST:
+                if not (sub in GIT_DRIVER_ALLOWLIST and " ".join(value.split()) in GIT_LFS_SAFE_MERGE):
                     risks.append(f"{label}: merge.{sub}.driver")
             elif name == "core" and key in ("fsmonitor", "sshcommand", "gitproxy", "askpass"):
                 if lowered not in ("", "false"):
@@ -418,14 +457,24 @@ def git_config_risks(root: str | Path) -> list[str]:
     return risks
 
 
+def _attribute_files(root: Path) -> list[tuple[str, Path]]:
+    """Every `.gitattributes` git honours: the working tree (all depths) plus `.git/info`."""
+    root = Path(root)
+    files: list[tuple[str, Path]] = []
+    for rel, path in iter_watch_files(root):
+        if path.name == ".gitattributes":
+            files.append((rel, path))
+    info = root / ".git" / "info" / "attributes"
+    if info.is_file():
+        files.append((".git/info/attributes", info))
+    return files
+
+
 def git_attribute_risks(root: str | Path) -> list[str]:
-    """Reasons `.gitattributes` or `.git/info/attributes` select a non-allowlisted driver."""
+    """Reasons any `.gitattributes` selects a non-allowlisted filter/diff/merge driver."""
     root = Path(root)
     risks: list[str] = []
-    for rel in (".gitattributes", ".git/info/attributes"):
-        path = root / rel
-        if not path.is_file():
-            continue
+    for rel, path in _attribute_files(root):
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
@@ -448,13 +497,29 @@ def git_control_risks(root: str | Path) -> list[str]:
 
 
 def assert_git_control_safe(root: str | Path) -> None:
-    """Refuse any git call while a config or attributes file can execute an agent's command."""
+    """Refuse any git call while a config or attributes file can execute an agent's command.
+
+    R4-2: also compare against the signed, last-known-good snapshot, so a change made between
+    turns (for example while Relay waits for a human) is caught before git runs it.
+    """
     risks = git_control_risks(root)
     if risks:
         raise IntegrityError(
             "unsafe git configuration or attributes (a filter, driver or include could run an "
             "agent's command): " + "; ".join(risks[:5])
         )
+    trust = _trust_for(root)
+    if trust is not None:
+        baseline = trust.git_control()
+        if baseline is not None:
+            changed = git_control_changes(baseline, git_control_snapshot(root))
+            if changed:
+                raise IntegrityError(
+                    "git control files changed since the last verified turn: "
+                    + ", ".join(changed[:5])
+                    + ". Restore them, or record a human-accepted baseline with "
+                    "`relay resume --accept-git-control --code <code>`."
+                )
 
 
 def _git(root: Path, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
@@ -503,7 +568,31 @@ def git_control_snapshot(root: str | Path) -> dict[str, str]:
         for path in sorted(hooks.iterdir()):
             if path.is_file():
                 out[path.relative_to(root).as_posix()] = sha256_file(path)
+    for rel, path in _attribute_files(root):
+        if rel == ".git/info/attributes":
+            out[rel] = sha256_file(path)
+        else:
+            out[rel] = sha256_file(path)
     return out
+
+
+def record_git_control(root: str | Path) -> dict:
+    """Store a signed "last known good" snapshot of the git control files (R4-2)."""
+    hashes = git_control_snapshot(root)
+    trust = _trust_for(root)
+    if trust is not None:
+        trust.set_git_control(hashes)
+    return hashes
+
+
+def accept_git_control(root: str | Path) -> dict:
+    """Human-accepted re-baseline: only when the current files are themselves safe."""
+    risks = git_control_risks(root)
+    if risks:
+        raise IntegrityError(
+            "refusing to accept git control files that are unsafe: " + "; ".join(risks[:5])
+        )
+    return record_git_control(root)
 
 
 def git_control_changes(before: dict[str, str], after: dict[str, str]) -> list[str]:

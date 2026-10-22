@@ -110,6 +110,8 @@ def init_project(
 
     if _write_new(paths.rules_claude, _render_rules("RULES_CLAUDE.md", cfg.project_dir.name), force=force):
         created.append("RULES_CLAUDE.md")
+    if _write_new(paths.rules_codex, _render_rules("RULES_CODEX.md", cfg.project_dir.name), force=force):
+        created.append("RULES_CODEX.md")
     if _write_new(paths.rules_coder, _render_rules("RULES_CODER.md", cfg.project_dir.name), force=force):
         created.append("RULES_CODER.md")
     if _write_new(paths.decisions, DECISIONS_HEADER, force=False):
@@ -130,7 +132,8 @@ def init_project(
     if bool(cfg.get("git.enabled", True)):
         git_init(cfg.project_dir)
         targets = [
-            ".gitignore", ".relay/GOAL.md", ".relay/RULES_CLAUDE.md", ".relay/RULES_CODER.md",
+            ".gitignore", ".relay/GOAL.md", ".relay/RULES_CLAUDE.md", ".relay/RULES_CODEX.md",
+        ".relay/RULES_CODER.md",
             ".relay/DECISIONS.md", ".relay/MONITOR_NOTES.md",
         ]
         existing = [target for target in targets if (cfg.project_dir / target).exists()]
@@ -145,4 +148,8 @@ def init_project(
         actor="harness",
         detail={"created": created, "goal": bool(goal.strip()), "git_commit": commit},
     )
+    # R4-2: remember the vetted git control files as the signed last-known-good baseline.
+    from .integrity import record_git_control
+
+    record_git_control(cfg.project_dir)
     return {"already_initialized": False, "created": created, "git_commit": commit}

@@ -74,6 +74,10 @@ class Paths:
         return self.relay_dir / "RULES_CLAUDE.md"
 
     @property
+    def rules_codex(self) -> Path:
+        return self.relay_dir / "RULES_CODEX.md"
+
+    @property
     def rules_coder(self) -> Path:
         return self.relay_dir / "RULES_CODER.md"
 
@@ -108,11 +112,15 @@ class Paths:
     def checkpoint(self, role: str) -> Path:
         return self.relay_dir / f"CHECKPOINT_{role}.md"
 
-    def sentinel(self, role: str) -> Path:
-        return self.relay_dir / ("CODER_DONE.json" if role == "coder" else "CLAUDE_DONE.json")
+    def sentinel(self, role: str, backend: str = "claude") -> Path:
+        from .backends import sentinel_name
 
-    def rule_for(self, role: str) -> Path:
-        return self.rules_coder if role == "coder" else self.rules_claude
+        return self.relay_dir / sentinel_name(role, backend)
+
+    def rule_for(self, role: str, backend: str = "claude") -> Path:
+        if role == "coder":
+            return self.rules_coder
+        return self.rules_codex if backend == "codex" else self.rules_claude
 
     # --- journal ----------------------------------------------------------
     @property
